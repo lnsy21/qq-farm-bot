@@ -6,7 +6,7 @@ export {};
 const protobuf = require('protobufjs');
 const { sendMsgAsync, getUserState } = require('../../utils/network');
 const { types } = require('../../utils/proto');
-const { toLong, sleep, randomDelay, logWarn } = require('../../utils/utils');
+const { toLong, toNum, sleep, randomDelay, log, logWarn } = require('../../utils/utils');
 
 // 操作限制更新回调 (由 friend.js 设置)
 let onOperationLimitsUpdate: ((limits: any) => void) | null = null;
@@ -33,9 +33,12 @@ async function sendPlantRequest(
 }
 
 async function getAllLands(): Promise<any> {
+    const forecast = require('../level-forecast');
+    const revision = forecast.getLandForecastRevision();
     const body = types.AllLandsRequest.encode(types.AllLandsRequest.create({})).finish();
     const { body: replyBody } = await sendMsgAsync('gamepb.plantpb.PlantService', 'AllLands', body);
     const reply = types.AllLandsReply.decode(replyBody);
+    forecast.rememberLandForecast(reply.lands, getUserState(), revision);
     // 更新操作限制
     if (reply.operation_limits && onOperationLimitsUpdate) {
         onOperationLimitsUpdate(reply.operation_limits);
@@ -59,23 +62,34 @@ async function waterLand(landIds: number[]): Promise<any> {
     return sendPlantRequest(types.WaterLandRequest, types.WaterLandReply, 'WaterLand', landIds, state.gid);
 }
 
-async function farming(landIds: number[]): Promise<any> {
+async function farming(landIds: number[], socialEventItemIds: Array<number | string> = []): Promise<any> {
     const state = getUserState();
-    const body = encodeOwnFarmingRequest(landIds, state.gid);
+    const body = encodeOwnFarmingRequest(landIds, state.gid, socialEventItemIds);
     const { body: replyBody } = await sendMsgAsync('gamepb.plantpb.PlantService', 'Farming', body);
     return types.FarmingReply.decode(replyBody);
 }
 
 /**
- * 自家一键务农。官方抓包会显式编码两个值为 0 的场景字段；不能依赖 proto3 默认省略。
+ * 自家单点/一键务农。官方抓包会显式编码两个值为 0 的场景字段；不能依赖 proto3 默认省略。
+ * 青蛙使坏瓶属于农场级社交事件，存在时还会以 packed int64 写入 field 5。
  * 好友帮助务农使用 field_4=2，由 friend/api.ts 单独编码。
  */
-function encodeOwnFarmingRequest(landIds: number[], hostGid: number | string): Uint8Array {
+function encodeOwnFarmingRequest(
+    landIds: number[],
+    hostGid: number | string,
+    socialEventItemIds: Array<number | string> = [],
+): Uint8Array {
+    const normalizedSocialEventItemIds = [...new Set(
+        (Array.isArray(socialEventItemIds) ? socialEventItemIds : [])
+            .map((value: number | string) => toNum(value))
+            .filter((value: number) => value > 0),
+    )];
     return types.FarmingRequest.encode(types.FarmingRequest.create({
         land_ids: landIds,
         host_gid: toLong(hostGid),
         field_3: 0,
         field_4: 0,
+        social_event_item_ids: normalizedSocialEventItemIds.map((value: number) => toLong(value)),
     })).finish();
 }
 
@@ -99,11 +113,23 @@ async function fertilizeOne(landId: number, fertilizerId: number = NORMAL_FERTIL
     return reply;
 }
 
+function getGatewayErrorCode(error: any): number {
+    const fromField = toNum(error?.code ?? error?.errorCode ?? error?.error_code);
+    if (fromField > 0) return fromField;
+    const match = String(error?.message || '').match(/\bcode=(\d+)\b/i);
+    return match ? toNum(match[1]) : 0;
+}
+
+function isSkippableFertilizeLandError(error: any): boolean {
+    const code = getGatewayErrorCode(error);
+    return code === 1001024 || code === 1001025;
+}
+
 /**
  * 施肥 - 必须逐块进行，服务器不支持批量
  * 游戏中拖动施肥间隔很短，这里用 50ms
  */
-async function fertilize(landIds: number[], fertilizerId: number = NORMAL_FERTILIZER_ID): Promise<number> {
+async function fertilize(landIds: number[], fertilizerId: number = NORMAL_FERTILIZER_ID, propagateErrors: boolean = false): Promise<number> {
     let successCount: number = 0;
     for (const landId of landIds) {
         try {
@@ -113,9 +139,20 @@ async function fertilize(landIds: number[], fertilizerId: number = NORMAL_FERTIL
             })).finish();
             await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', body);
             successCount++;
-        } catch {
-            // 施肥失败（可能肥料不足），停止继续
-            break;
+        } catch (error) {
+            if (isSkippableFertilizeLandError(error)) {
+                log('施肥', `第 ${landId} 块地当前不能施肥，已跳过`, {
+                    module: 'farm',
+                    event: '施肥',
+                    result: 'skip',
+                    landId,
+                    code: getGatewayErrorCode(error),
+                });
+            } else if (propagateErrors) {
+                throw error;
+            } else {
+                break;
+            }
         }
         if (landIds.length > 1) await sleep(50);  // 50ms 间隔
     }
@@ -126,7 +163,7 @@ async function fertilize(landIds: number[], fertilizerId: number = NORMAL_FERTIL
  * 有机肥循环施肥:
  * 按地块顺序循环施肥，失败或达到单次操作上限时停止。
  */
-async function fertilizeOrganicLoop(landIds: number[] | any[]): Promise<number> {
+async function fertilizeOrganicLoop(landIds: number[] | any[], propagateErrors: boolean = false): Promise<number> {
     const ids: number[] = (Array.isArray(landIds) ? landIds : []).filter(Boolean);
     if (ids.length === 0) return 0;
 
@@ -146,8 +183,9 @@ async function fertilizeOrganicLoop(landIds: number[] | any[]): Promise<number> 
             })).finish();
             await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', body);
             successCount++;
-        } catch {
+        } catch (error) {
             // 常见是有机肥耗尽，按需求直接停止
+            if (propagateErrors) throw error;
             break;
         }
 
@@ -239,6 +277,7 @@ module.exports = {
     encodeOwnFarmingRequest,
     fertilizeOne,
     fertilize,
+    isSkippableFertilizeLandError,
     fertilizeOrganicLoop,
     removePlant,
     upgradeLand,

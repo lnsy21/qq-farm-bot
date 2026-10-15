@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 
 const props = withDefaults(defineProps<{
   land: any
+  showDetails?: boolean
   selectable?: boolean
   selected?: boolean
   selectionDisabled?: boolean
@@ -12,6 +13,10 @@ const props = withDefaults(defineProps<{
   normalFertilizerDisabled?: boolean
   organicFertilizerDisabled?: boolean
   organicFertilizerLabel?: string
+  normalFertilizerLabel?: string
+  showFarmingAction?: boolean
+  farmingPending?: boolean
+  farmingDisabled?: boolean
 }>(), {
   selectable: false,
   selected: false,
@@ -22,14 +27,23 @@ const props = withDefaults(defineProps<{
   normalFertilizerDisabled: false,
   organicFertilizerDisabled: false,
   organicFertilizerLabel: '',
+  normalFertilizerLabel: '',
+  showFarmingAction: false,
+  farmingPending: false,
+  farmingDisabled: false,
 })
 
 const emit = defineEmits<{
   select: [land: any]
   fertilize: [land: any, fertilizerType: 'normal' | 'organic']
+  farm: [land: any]
+  details: [land: any]
 }>()
 
 const land = computed(() => props.land)
+
+// 上游资源已统一按变异 ID 命名；仍保留加载失败回退，兼容尚无 PNG 的变异。
+const failedMutantIcons = ref(new Set<number>())
 
 const mutantEffects = computed(() => {
   const effects = Array.isArray(land.value?.mutantEffects) ? land.value.mutantEffects : []
@@ -56,6 +70,10 @@ const mutantEffects = computed(() => {
     })
     .filter((effect: { name: string }) => !!effect.name)
 })
+
+const purpleCrystalResonancePercent = computed(() => (
+  Math.max(0, Number(land.value?.purpleCrystalResonanceExpBonus) || 0) / 100
+))
 
 const growProgress = computed(() => {
   const matureInSec = land.value.matureInSec || 0
@@ -177,11 +195,17 @@ function requestFertilize(event: Event, fertilizerType: 'normal' | 'organic') {
   emit('fertilize', props.land, fertilizerType)
 }
 
-const organicRemainingText = computed(() => {
-  const left = land.value?.leftInorcFertTimes
-  if (left == null || Number.isNaN(Number(left)))
+function requestFarming(event: Event) {
+  event.stopPropagation()
+  if (!props.farmingPending && !props.farmingDisabled)
+    emit('farm', props.land)
+}
+
+const normalRemainingText = computed(() => {
+  const left = Number(land.value?.leftInorcFertTimes)
+  if (!Number.isFinite(left) || left <= 0)
     return ''
-  return `有机剩 ${Math.max(0, Number(left))}`
+  return `普通剩 ${left}`
 })
 
 function interactionEffectBadges(land: any) {
@@ -209,6 +233,8 @@ function interactionBadgeClass(itemId: string) {
     return 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300'
   if (itemId === '301103')
     return 'bg-pink-100 text-pink-800 dark:bg-pink-900/40 dark:text-pink-300'
+  if (itemId === '5006')
+    return 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-200'
   return 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'
 }
 
@@ -232,6 +258,8 @@ function mutantBadgeClass(effect: { icon?: string }) {
     lucky: 'bg-lime-100 text-lime-800 dark:bg-lime-900/40 dark:text-lime-300',
     luxury: 'bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300',
     shinning: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300',
+    lightning: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+    butterfly: 'bg-fuchsia-100 text-fuchsia-800 dark:bg-fuchsia-900/40 dark:text-fuchsia-300',
   }
   return map[icon] || 'bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300'
 }
@@ -239,6 +267,21 @@ function mutantBadgeClass(effect: { icon?: string }) {
 function mutantIconUrl(id: number) {
   const numericId = Number(id) || 0
   return numericId > 0 ? `/game-config/seed_images_named/mutant/${numericId}.png` : ''
+}
+
+function mutantIconName(effect: { icon?: string }) {
+  return String(effect?.icon || '').trim().toLowerCase()
+}
+
+function showMutantImage(effect: { id?: number }) {
+  const id = Number(effect?.id) || 0
+  return id > 0 && !failedMutantIcons.value.has(id)
+}
+
+function markMutantIconFailed(effect: { id?: number }) {
+  const id = Number(effect?.id) || 0
+  if (id > 0)
+    failedMutantIcons.value = new Set(failedMutantIcons.value).add(id)
 }
 </script>
 
@@ -339,7 +382,17 @@ function mutantIconUrl(id: number) {
     </div>
 
     <!-- Status Badges (game-style) -->
+    <button v-if="showDetails" type="button" class="mt-1 rounded px-2 py-1 text-[11px] text-gray-600 underline underline-offset-3 decoration-dotted dark:text-gray-300 hover:text-green-700 focus-visible:outline" :aria-label="`查看第 ${land.id} 块土地详情`" @click.stop="emit('details', land)" @keydown.stop>
+      土地详情
+    </button>
     <div class="mt-auto flex flex-wrap items-center justify-center gap-1 pt-1">
+      <span
+        v-if="purpleCrystalResonancePercent > 0"
+        class="badge-purple-crystal inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-bold"
+        :title="`紫金土地上的任意变异作物经验 +${purpleCrystalResonancePercent}%`"
+      >
+        <span class="i-carbon-flash-filled" /> 紫晶共鸣
+      </span>
       <span
         v-for="effect in mutantEffects"
         :key="effect.id || effect.name"
@@ -348,11 +401,14 @@ function mutantIconUrl(id: number) {
         :title="effect.description || effect.name"
       >
         <img
-          v-if="effect.icon"
+          v-if="showMutantImage(effect)"
           :src="mutantIconUrl(effect.id)"
           :alt="effect.name"
           class="h-3 w-3 object-contain"
+          @error="markMutantIconFailed(effect)"
         >
+        <span v-else-if="mutantIconName(effect) === 'lightning'" class="i-carbon-lightning" />
+        <span v-else-if="mutantIconName(effect) === 'butterfly'" class="i-carbon-bee" />
         <span v-else class="i-carbon-star" />
         {{ effect.name }}
       </span>
@@ -402,11 +458,25 @@ function mutantIconUrl(id: number) {
         <span class="i-carbon-wheat" /> 成熟不可偷
       </span>
       <span
-        v-if="showFertilizerActions && organicRemainingText"
+        v-if="showFertilizerActions && normalRemainingText"
         class="inline-flex items-center gap-0.5 rounded-full bg-lime-100 px-1.5 py-0.5 text-[10px] text-lime-800 font-bold dark:bg-lime-900/40 dark:text-lime-300"
       >
-        <span class="i-carbon-chemistry" /> {{ organicRemainingText }}
+        <span class="i-carbon-chemistry" /> {{ normalRemainingText }}
       </span>
+    </div>
+
+    <div v-if="showFarmingAction" class="farming-action-wrap mt-2 w-full" @click.stop>
+      <button
+        type="button"
+        class="farming-action"
+        :disabled="farmingPending || farmingDisabled"
+        title="清理该地块的缺水、杂草、虫害或乌云，并同时处理农场中的青蛙"
+        @click="requestFarming"
+      >
+        <span v-if="farmingPending" class="i-svg-spinners-90-ring-with-bg" />
+        <span v-else class="i-carbon-clean" />
+        务农
+      </button>
     </div>
 
     <div v-if="showFertilizerActions" class="fertilizer-actions mt-2 w-full" @click.stop>
@@ -414,7 +484,7 @@ function mutantIconUrl(id: number) {
         type="button"
         class="fertilizer-action fertilizer-action--normal"
         :disabled="fertilizerPending || normalFertilizerDisabled"
-        title="对该地块施一次普通化肥"
+        :title="normalFertilizerDisabled ? (normalFertilizerLabel || '本季已施过普通化肥') : '对该地块施一次普通化肥'"
         @click="requestFertilize($event, 'normal')"
       >
         <span v-if="fertilizerPending" class="i-svg-spinners-90-ring-with-bg" />
@@ -960,10 +1030,50 @@ function mutantIconUrl(id: number) {
   animation: none;
 }
 
+.badge-purple-crystal {
+  color: #6d3da0;
+  border: 1px solid rgba(146, 103, 190, 0.35);
+  background: linear-gradient(135deg, rgba(239, 225, 255, 0.96), rgba(218, 244, 255, 0.92));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.75);
+}
+
+:global(.dark) .badge-purple-crystal {
+  color: #e9d5ff;
+  border-color: rgba(196, 151, 255, 0.34);
+  background: linear-gradient(135deg, rgba(88, 49, 121, 0.58), rgba(33, 82, 102, 0.52));
+}
+
 .fertilizer-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 6px;
+}
+
+.farming-action {
+  width: 100%;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid #a9d4b0;
+  border-radius: 8px;
+  color: #245f4b;
+  background: #eaf8ed;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.farming-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+:global(.dark) .farming-action {
+  color: #bbf7d0;
+  border-color: rgba(169, 212, 176, 0.38);
+  background: rgba(20, 80, 50, 0.35);
 }
 
 .fertilizer-action {

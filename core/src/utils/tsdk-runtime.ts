@@ -10,11 +10,20 @@ const { CONFIG } = require('../config/config');
 const { ensureDataDir, getResourcePath } = require('../config/runtime-paths');
 const { log, logWarn } = require('./utils');
 
-const TSDK_VERSION = 'v3.9.0.1787056896';
-const TSDK_SHA256 = '1959d2baed17ba3cb28e8fd1c760684e4120a2bde1863551a3c3a7f844627e77';
-const MINI_PROGRAM_APP_ID = 'wx5306c5978fdb76e4';
+const TSDK_VERSION = 'v3.9.0.1790414929';
+const TSDK_SHA256 = 'f80c5f34f4e7dc55af468fbfd0a6e6ca43d0a1dcecd3f30731063aaf94704ff4';
+const TSDK_BUILDS = Object.freeze({
+    qq: { file: 'tsdk.wasm', version: TSDK_VERSION, sha256: TSDK_SHA256 },
+    wx: { file: 'tsdk-wx.wasm', version: 'v3.9.0.1790237209', sha256: '4bf6aa0ede9677fe82186c1a76f8df8a14ccd6d14b6ff1280230923189f4e972' },
+});
+const MINI_PROGRAM_APP_IDS = Object.freeze({
+    qq: '1112386029',
+    wx: 'wx5306c5978fdb76e4',
+});
 const TSDK_GAME_ID = 3167;
 const TSDK_APP_KEY = '0';
+const QQ_USER_DATA_PATH = 'qqfile://usr/';
+const QQ_DEVICE_TEXT = 'windows;windows;windows 10.0;0;';
 const RUNTIME_TABLE = Buffer.from([
     93, 86, 110, 34, 65, 129, 8, 113, 53, 192, 121, 32, 86, 162, 255, 139,
     217, 70, 223, 0, 45, 176, 85, 103, 234, 116, 120, 194, 206, 7, 176, 222,
@@ -22,12 +31,52 @@ const RUNTIME_TABLE = Buffer.from([
     209, 117, 218, 8, 107, 241, 32, 62, 53, 200, 238,
 ]);
 const MERGED_DATA_KEY = 1871261153;
-const MERGED_DATA_SEGMENTS = [
-    [1024, 5541], [6580, 8989], [15585, 33], [15643, 1], [15655, 21],
-    [15701, 1], [15713, 21], [15759, 1], [15771, 30], [15826, 14],
-    [15875, 1], [15887, 21], [15933, 1], [15945, 671], [16632, 400],
-    [17040, 103], [67371008, 404],
-] as const;
+const MERGED_DATA_METADATA = [67371008, 404] as const;
+const QQ_HOST_FEATURE_STATE = Object.freeze({
+    currentPtr: 17288,
+    referencePtr: 17352,
+    length: 64,
+    nodeMismatchIndex: 1,
+});
+
+type TsdkPlatform = 'qq' | 'wx';
+
+interface TsdkRuntimeOptions {
+    accountId?: unknown;
+    dataDir?: string;
+    platform?: unknown;
+}
+
+interface TsdkHostProfile {
+    appId: string;
+    debugMode: number;
+    deviceText?: string;
+    platform: TsdkPlatform;
+    userDataPath?: string;
+}
+
+function resolveTsdkPlatform(value: unknown): TsdkPlatform {
+    const normalized = String(value || '').trim().toLowerCase();
+    return normalized === 'wx' || normalized === 'wechat' ? 'wx' : 'qq';
+}
+
+function resolveTsdkHostProfile(value: unknown): TsdkHostProfile {
+    const platform = resolveTsdkPlatform(value);
+    if (platform === 'qq') {
+        return {
+            appId: MINI_PROGRAM_APP_IDS.qq,
+            debugMode: 0,
+            deviceText: QQ_DEVICE_TEXT,
+            platform,
+            userDataPath: QQ_USER_DATA_PATH,
+        };
+    }
+    return {
+        appId: MINI_PROGRAM_APP_IDS.wx,
+        debugMode: 2,
+        platform,
+    };
+}
 
 interface TsdkExports {
     w: WebAssembly.Memory;
@@ -57,6 +106,7 @@ interface TsdkExports {
 class TsdkRuntime {
     private accountId: string;
     private dataDir: string;
+    private hostProfile: TsdkHostProfile;
     private memory: WebAssembly.Memory | null = null;
     private exports: TsdkExports | null = null;
     private initPromise: Promise<void> | null = null;
@@ -65,16 +115,63 @@ class TsdkRuntime {
     private userBound = false;
     private serverTimeGeneration = 0;
     private warned = new Set<string>();
+    private unsupportedAceVmCalls = 0;
+    private lastUnsupportedAceVmAt = 0;
+    private lastUnsupportedAceVmTaskHash = '';
+    private lastUnsupportedAceVmTaskBytes = 0;
+    private lastUnsupportedAceVmTaskReadFailed = false;
 
-    constructor() {
-        this.accountId = String(process.env.FARM_ACCOUNT_ID || 'default');
-        this.dataDir = path.join(ensureDataDir(), 'tsdk', this.accountId);
+    getDiagnostics() {
+        return {
+            platform: this.hostProfile.platform,
+            version: TSDK_BUILDS[this.hostProfile.platform].version,
+            ready: this.ready,
+            unsupportedAceVmCalls: this.unsupportedAceVmCalls,
+            lastUnsupportedAceVmAt: this.lastUnsupportedAceVmAt,
+            lastUnsupportedAceVmTaskHash: this.lastUnsupportedAceVmTaskHash,
+            lastUnsupportedAceVmTaskBytes: this.lastUnsupportedAceVmTaskBytes,
+            lastUnsupportedAceVmTaskReadFailed: this.lastUnsupportedAceVmTaskReadFailed,
+        };
+    }
+
+    constructor(options: TsdkRuntimeOptions = {}) {
+        this.accountId = String(options.accountId || process.env.FARM_ACCOUNT_ID || 'default');
+        this.dataDir = options.dataDir
+            ? path.resolve(options.dataDir)
+            : path.join(ensureDataDir(), 'tsdk', this.accountId);
+        this.hostProfile = resolveTsdkHostProfile(options.platform ?? CONFIG.platform);
     }
 
     private warnOnce(key: string, message: string): void {
         if (this.warned.has(key)) return;
         this.warned.add(key);
-        logWarn('ACE', message);
+        logWarn('ACE', message, { event: 'tsdk_host_limitation', feature: key, ...this.getDiagnostics() });
+    }
+
+    private recordUnsupportedAceVm(ptr: number): number {
+        this.unsupportedAceVmCalls += 1;
+        this.lastUnsupportedAceVmAt = Date.now();
+        this.lastUnsupportedAceVmTaskHash = '';
+        this.lastUnsupportedAceVmTaskBytes = 0;
+        this.lastUnsupportedAceVmTaskReadFailed = false;
+        try {
+            // The official ABI takes a NUL-terminated task. Hash the original
+            // bytes, without decoding, executing, retaining or logging the task.
+            if (!ptr) throw new Error('Missing ACEVM task');
+            this.ensureBounds(ptr, 1);
+            const view = this.view();
+            const limit = Math.min(view.length, ptr + 65537);
+            let end = ptr;
+            while (end < limit && view[end] !== 0) end++;
+            if (end >= limit) throw new Error('ACEVM task exceeds diagnostic limit');
+            this.lastUnsupportedAceVmTaskHash = crypto.createHash('sha256').update(view.subarray(ptr, end)).digest('hex');
+            this.lastUnsupportedAceVmTaskBytes = end - ptr;
+        } catch {
+            // Diagnostics must not turn an unsupported call into a WASM trap.
+            this.lastUnsupportedAceVmTaskReadFailed = true;
+        }
+        this.warnOnce('acevm', '服务端触发 ACEVM 检查，但当前宿主未执行该任务，返回失败状态；请保留掉线诊断');
+        return 0;
     }
 
     private view(): Uint8Array {
@@ -119,7 +216,10 @@ class TsdkRuntime {
     }
 
     private resolveDataPath(input: string): string {
-        const relative = String(input || '').replaceAll('\\', '/').replace(/^\/+/, '');
+        const relative = String(input || '')
+            .replaceAll('\\', '/')
+            .replace(/^(?:qq|wx)file:\/\/usr(?:\/|$)/i, '')
+            .replace(/^\/+/, '');
         const root = path.resolve(this.dataDir);
         const target = path.resolve(root, relative);
         if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
@@ -129,6 +229,7 @@ class TsdkRuntime {
     }
 
     private getDeviceText(): string {
+        if (this.hostProfile.deviceText) return this.hostProfile.deviceText;
         const device = CONFIG.deviceInfo || {};
         const model = String(device.deviceId || `${os.type()} ${os.arch()}`);
         const platform = String(CONFIG.os || process.platform);
@@ -157,14 +258,11 @@ class TsdkRuntime {
                     }
                 },
                 c: (ptr: number, capacity: number) => {
-                    const stack = new Error().stack || '';
+                    const stack = new Error('TSDK JavaScript 调用栈').stack || '';
                     return this.writeCString(stack, ptr, capacity) ? Buffer.byteLength(stack, 'utf8') + 1 : 0;
                 },
-                d: (ptr: number, capacity: number) => this.writeCString(TSDK_VERSION, ptr, capacity),
-                e: () => {
-                    this.warnOnce('acevm', 'Node.js 环境不提供小游戏 ACEVM 完整性上下文，使用空结果');
-                    return 0;
-                },
+                d: (ptr: number, capacity: number) => this.writeCString(TSDK_BUILDS[this.hostProfile.platform].version, ptr, capacity),
+                e: (ptr: number) => this.recordUnsupportedAceVm(ptr),
                 f: () => this.warnOnce('sensors', 'Node.js 环境不提供触摸和陀螺仪数据'),
                 g: (filePtr: number, outputPtr: number, capacity: number, encodingPtr: number) => {
                     try {
@@ -183,12 +281,16 @@ class TsdkRuntime {
                     view[(outputPtr + 4) >> 2] = Math.floor(value / 0x100000000) >>> 0;
                     return 0;
                 },
-                i: (ptr: number, capacity: number) => this.writeCString(`${this.dataDir}${path.sep}`, ptr, capacity),
+                i: (ptr: number, capacity: number) => this.writeCString(
+                    this.hostProfile.userDataPath || `${this.dataDir}${path.sep}`,
+                    ptr,
+                    capacity,
+                ),
                 j: (ptr: number, capacity: number) => this.writeCString(this.getDeviceText(), ptr, capacity),
                 k: (ptr: number, capacity: number) => this.writeBytes(RUNTIME_TABLE, ptr, capacity),
-                l: () => 2,
-                m: (ptr: number, capacity: number) => this.writeCString(MINI_PROGRAM_APP_ID, ptr, capacity),
-                n: (ptr: number, capacity: number) => this.writeCString(MINI_PROGRAM_APP_ID, ptr, capacity),
+                l: () => this.hostProfile.debugMode,
+                m: (ptr: number, capacity: number) => this.writeCString(this.hostProfile.appId, ptr, capacity),
+                n: (ptr: number, capacity: number) => this.writeCString(this.hostProfile.appId, ptr, capacity),
                 o: () => this.warnOnce('integrity-functions', 'Node.js 环境不提供小游戏函数完整性列表'),
                 p: (filePtr: number) => {
                     try {
@@ -250,10 +352,13 @@ class TsdkRuntime {
         if (this.destroyed) throw new Error('TSDK 运行时已销毁');
 
         this.initPromise = (async () => {
-            const wasmPath = getResourcePath('utils', 'tsdk.wasm');
+            const build = TSDK_BUILDS[this.hostProfile.platform];
+            const resourcePath = getResourcePath('utils', build.file);
+            // pkg executes compiled modules under dist/, while WASM assets live under src/.
+            const wasmPath = fs.existsSync(resourcePath) ? resourcePath : path.join(__dirname, '..', '..', 'src', 'utils', build.file);
             const wasm = fs.readFileSync(wasmPath);
             const hash = crypto.createHash('sha256').update(wasm).digest('hex');
-            if (hash !== TSDK_SHA256) throw new Error(`TSDK 文件校验失败: ${hash}`);
+            if (hash !== build.sha256) throw new Error(`TSDK 文件校验失败: ${hash}`);
             fs.mkdirSync(this.dataDir, { recursive: true });
 
             const { instance } = await WebAssembly.instantiate(wasm, this.createImports());
@@ -267,10 +372,12 @@ class TsdkRuntime {
 
             const decryptSegment = this.exports.__mergewasm_shared____wasm_decrypt_strings;
             if (typeof decryptSegment !== 'function') throw new Error('TSDK 缺少 mergewasm 数据解密导出');
-            for (const [ptr, length] of MERGED_DATA_SEGMENTS) {
-                this.ensureBounds(ptr, length);
-                decryptSegment(ptr, length, MERGED_DATA_KEY);
-            }
+            const decryptAllData = this.exports.decrypt_all_data;
+            if (typeof decryptAllData !== 'function') throw new Error('TSDK 缺少 mergewasm 全量数据解密导出');
+            const [metadataPtr, metadataLength] = MERGED_DATA_METADATA;
+            this.ensureBounds(metadataPtr, metadataLength);
+            decryptSegment(metadataPtr, metadataLength, MERGED_DATA_KEY);
+            decryptAllData();
             this.exports.x();
 
             const appKey = this.allocCString(TSDK_APP_KEY);
@@ -280,7 +387,7 @@ class TsdkRuntime {
                 this.free(appKey.ptr);
             }
             this.ready = true;
-            log('ACE', `新版 TSDK 初始化成功: ${TSDK_VERSION}`);
+            log('ACE', `新版 TSDK 初始化成功: ${build.version} (${this.hostProfile.platform})`);
         })().catch((e: any) => {
             this.ready = false;
             this.exports = null;
@@ -293,6 +400,34 @@ class TsdkRuntime {
 
     private assertReady(): void {
         if (!this.ready || !this.exports || !this.memory || this.destroyed) throw new Error('TSDK 尚未就绪');
+    }
+
+    private normalizeQqHostFeatureState(): void {
+        if (this.hostProfile.platform !== 'qq') return;
+        const {
+            currentPtr,
+            referencePtr,
+            length,
+            nodeMismatchIndex,
+        } = QQ_HOST_FEATURE_STATE;
+        this.ensureBounds(currentPtr, length);
+        this.ensureBounds(referencePtr, length);
+        const view = this.view();
+        const mismatches: number[] = [];
+        for (let index = 0; index < length; index += 1) {
+            if (view[currentPtr + index] !== view[referencePtr + index]) mismatches.push(index);
+        }
+        if (mismatches.length === 0) return;
+        const currentValue = view[currentPtr + nodeMismatchIndex];
+        const referenceValue = view[referencePtr + nodeMismatchIndex];
+        if (
+            mismatches.length !== 1
+            || mismatches[0] !== nodeMismatchIndex
+            || currentValue !== referenceValue + 1
+        ) {
+            throw new Error('TSDK QQ 宿主特征布局与已验证版本不一致');
+        }
+        view[currentPtr + nodeMismatchIndex] = referenceValue;
     }
 
     private alloc(length: number): number {
@@ -350,6 +485,7 @@ class TsdkRuntime {
 
     getEncryptedInitInfo(): string {
         this.assertReady();
+        this.normalizeQqHostFeatureState();
         const ptr = this.exports.H();
         return ptr ? this.readCString(ptr, 64 * 1024) : '';
     }
@@ -398,6 +534,9 @@ module.exports = {
     TsdkRuntime,
     TSDK_VERSION,
     TSDK_SHA256,
-    MINI_PROGRAM_APP_ID,
+    TSDK_BUILDS,
+    MINI_PROGRAM_APP_IDS,
     TSDK_GAME_ID,
+    resolveTsdkHostProfile,
+    resolveTsdkPlatform,
 };

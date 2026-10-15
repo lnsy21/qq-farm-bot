@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { useMediaQuery } from '@vueuse/core'
-import { NButton, NInput, NPagination } from 'naive-ui'
+import { NButton } from 'naive-ui/es/button'
+import { NInput } from 'naive-ui/es/input'
+import { NPagination } from 'naive-ui/es/pagination'
 import { computed, onMounted, ref, watch } from 'vue'
-import api from '@/api'
+import api, { getApiErrorMessage } from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import { useToastStore } from '@/stores/toast'
@@ -19,7 +21,7 @@ const activeTab = computed(() => props.section)
 const loading = ref(false)
 const imageErrors = ref<Record<string | number, boolean>>({})
 const searchKeyword = ref('')
-const isDesktop = useMediaQuery('(min-width: 640px)')
+const isDesktop = useMediaQuery('(min-width: 768px)')
 const currentPage = ref(1)
 const pageSize = computed(() => isDesktop.value ? 50 : 30)
 
@@ -326,11 +328,11 @@ async function handleToggleBlacklist(seedId: number) {
         toast.success(data.message || '操作成功')
       }
       else {
-        toast.error(data.error || '操作失败')
+        toast.error(getApiErrorMessage(data, '操作失败'))
       }
     }
     catch (e: any) {
-      toast.error(e.response?.data?.error || e.message)
+      toast.error(getApiErrorMessage(e, '请求失败'))
     }
   })
 }
@@ -465,7 +467,7 @@ function formatPrice(price: number, priceId?: number): string {
                   <th class="px-4 py-3 font-medium">
                     价格
                   </th>
-                  <th class="px-4 py-3 text-center font-medium">
+                  <th class="sticky right-0 z-10 bg-gray-50 px-4 py-3 text-center font-medium shadow-[-1px_0_0_0_rgba(0,0,0,0.05)] dark:bg-gray-800">
                     操作
                   </th>
                 </tr>
@@ -515,7 +517,7 @@ function formatPrice(price: number, priceId?: number): string {
                   <td class="px-4 py-2 text-amber-600 font-medium dark:text-amber-400">
                     {{ formatPrice(item.price, item.priceId) }}
                   </td>
-                  <td class="px-4 py-2 text-center">
+                  <td class="sticky right-0 bg-white px-4 py-2 text-center shadow-[-1px_0_0_0_rgba(0,0,0,0.05)] dark:bg-gray-800 dark:group-hover:bg-gray-700/50">
                     <div class="flex items-center justify-center gap-1">
                       <NButton
                         quaternary
@@ -566,6 +568,19 @@ function formatPrice(price: number, priceId?: number): string {
                   <span class="text-amber-600">{{ formatPrice(item.price, item.priceId) }}</span>
                 </div>
               </div>
+            </div>
+            <div class="mt-3 flex justify-end border-t border-gray-100 pt-2 dark:border-gray-700">
+              <NButton
+                quaternary
+                size="small"
+                type="warning"
+                title="加入/移出黑名单"
+                aria-label="加入或移出黑名单"
+                @click="handleToggleBlacklist(item.seedId)"
+              >
+                <span class="i-carbon-user-x-ray mr-1" />
+                黑名单
+              </NButton>
             </div>
           </div>
         </div>

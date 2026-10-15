@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import api from '@/api'
+import api, { getApiErrorMessage } from '@/api'
 
 export interface PetInfo {
   id: number
@@ -15,6 +15,7 @@ export interface PetInfo {
   level: number
   status: number
   owned: boolean
+  activatable: boolean
   active: boolean
 }
 
@@ -114,7 +115,7 @@ export const usePetStore = defineStore('pet', () => {
         skipErrorToast: true,
       } as any)
       if (!res.data?.ok) {
-        error.value = String(res.data?.error || '获取守护记录失败')
+        error.value = getApiErrorMessage(res.data, '获取守护记录失败')
         return false
       }
       if (accountId.value === id) {
@@ -124,7 +125,7 @@ export const usePetStore = defineStore('pet', () => {
       return true
     }
     catch (cause: any) {
-      error.value = String(cause?.response?.data?.error || cause?.message || '获取守护记录失败')
+      error.value = getApiErrorMessage(cause, '获取守护记录失败')
       return false
     }
     finally {
@@ -150,7 +151,7 @@ export const usePetStore = defineStore('pet', () => {
       if (sequence !== requestSequence || accountId.value !== id)
         return false
       if (!res.data?.ok) {
-        error.value = String(res.data?.error || '无法读取宠物信息')
+        error.value = getApiErrorMessage(res.data, '无法读取宠物信息')
         return false
       }
       snapshot.value = res.data.data as PetSnapshot
@@ -159,7 +160,7 @@ export const usePetStore = defineStore('pet', () => {
     catch (cause: any) {
       if (sequence !== requestSequence || accountId.value !== id)
         return false
-      error.value = String(cause?.response?.data?.error || cause?.message || '无法读取宠物信息')
+      error.value = getApiErrorMessage(cause, '无法读取宠物信息')
       return false
     }
     finally {
@@ -183,7 +184,7 @@ export const usePetStore = defineStore('pet', () => {
       } as any)
       if (!res.data?.ok || res.data?.data?.error) {
         if (sequence === giftRequestSequence && accountId.value === id)
-          giftError.value = String(res.data?.data?.error || res.data?.error || '拾取礼包失败')
+          giftError.value = getApiErrorMessage(res.data?.data?.error ? res.data.data : res.data, '拾取礼包失败')
         return null
       }
 
@@ -200,7 +201,7 @@ export const usePetStore = defineStore('pet', () => {
     }
     catch (cause: any) {
       if (sequence === giftRequestSequence && accountId.value === id)
-        giftError.value = String(cause?.response?.data?.error || cause?.message || '拾取礼包失败')
+        giftError.value = getApiErrorMessage(cause, '拾取礼包失败')
       return null
     }
     finally {
@@ -222,7 +223,7 @@ export const usePetStore = defineStore('pet', () => {
         skipErrorToast: true,
       } as any)
       if (!res.data?.ok) {
-        error.value = String(res.data?.error || '使用狗粮失败')
+        error.value = getApiErrorMessage(res.data, '使用狗粮失败')
         return null
       }
       if (accountId.value === id && res.data?.data)
@@ -230,11 +231,36 @@ export const usePetStore = defineStore('pet', () => {
       return res.data.data
     }
     catch (cause: any) {
-      error.value = String(cause?.response?.data?.error || cause?.message || '使用狗粮失败')
+      error.value = getApiErrorMessage(cause, '使用狗粮失败')
       return null
     }
     finally {
       usingFood.value = false
+    }
+  }
+
+  async function activateDog(requestedAccountId: string, dogId: number) {
+    const id = String(requestedAccountId || '').trim()
+    if (!id || operatingDogId.value)
+      return null
+    operatingDogId.value = dogId
+    error.value = ''
+    try {
+      const res = await api.post('/api/pets/activate', { dogId }, { headers: { 'x-account-id': id }, skipErrorToast: true } as any)
+      if (!res.data?.ok) {
+        error.value = getApiErrorMessage(res.data, '宠物激活失败')
+        return null
+      }
+      if (accountId.value === id)
+        snapshot.value = res.data.data as PetSnapshot
+      return res.data.data
+    }
+    catch (cause: any) {
+      error.value = getApiErrorMessage(cause, '宠物激活失败')
+      return null
+    }
+    finally {
+      operatingDogId.value = 0
     }
   }
 
@@ -247,7 +273,7 @@ export const usePetStore = defineStore('pet', () => {
     try {
       const res = await api.post('/api/pets/deploy', { dogId }, { headers: { 'x-account-id': id }, skipErrorToast: true } as any)
       if (!res.data?.ok) {
-        error.value = String(res.data?.error || '宠物上场失败')
+        error.value = getApiErrorMessage(res.data, '宠物上场失败')
         return null
       }
       if (accountId.value === id)
@@ -255,7 +281,7 @@ export const usePetStore = defineStore('pet', () => {
       return res.data.data
     }
     catch (cause: any) {
-      error.value = String(cause?.response?.data?.error || cause?.message || '宠物上场失败')
+      error.value = getApiErrorMessage(cause, '宠物上场失败')
       return null
     }
     finally {
@@ -272,7 +298,7 @@ export const usePetStore = defineStore('pet', () => {
     try {
       const res = await api.post('/api/pets/withdraw', {}, { headers: { 'x-account-id': id }, skipErrorToast: true } as any)
       if (!res.data?.ok) {
-        error.value = String(res.data?.error || '宠物收回失败')
+        error.value = getApiErrorMessage(res.data, '宠物收回失败')
         return null
       }
       if (accountId.value === id)
@@ -280,7 +306,7 @@ export const usePetStore = defineStore('pet', () => {
       return res.data.data
     }
     catch (cause: any) {
-      error.value = String(cause?.response?.data?.error || cause?.message || '宠物收回失败')
+      error.value = getApiErrorMessage(cause, '宠物收回失败')
       return null
     }
     finally {
@@ -307,6 +333,7 @@ export const usePetStore = defineStore('pet', () => {
     fetchProtectLogs,
     claimDogSkillGifts,
     useDogFood,
+    activateDog,
     deployDog,
     withdrawDog,
     clear,

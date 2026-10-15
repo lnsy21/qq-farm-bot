@@ -2,13 +2,15 @@
 import type { FertilizerType } from '@/stores/farm'
 import type { FriendInteractionItemDto, FriendInteractionResultDto } from '@/stores/friend'
 import { useIntervalFn } from '@vueuse/core'
-import { NButton } from 'naive-ui'
+import { NButton } from 'naive-ui/es/button'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { getApiErrorMessage } from '@/api'
 import CareerHarvestSteal from '@/components/CareerHarvestSteal.vue'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 import LandCard from '@/components/LandCard.vue'
+import LandDetailModal from '@/components/LandDetailModal.vue'
 import { useAccountStore } from '@/stores/account'
 import { useFarmStore } from '@/stores/farm'
 import { useSettingStore } from '@/stores/setting'
@@ -25,6 +27,7 @@ const route = useRoute()
 const {
   lands,
   summary,
+  socialEvents,
   career,
   loading,
   loaded,
@@ -40,6 +43,11 @@ const {
 const { currentAccountId, currentAccount } = storeToRefs(accountStore)
 const { settings } = storeToRefs(settingStore)
 const { status } = storeToRefs(statusStore)
+const detailLandId = ref<number | null>(null)
+const detailLand = computed(() => lands.value.find(land => land.id === detailLandId.value) || null)
+watch(currentAccountId, () => {
+  detailLandId.value = null
+})
 
 const currentAccountConnected = computed(() => {
   const accountId = String(currentAccountId.value || '')
@@ -53,6 +61,7 @@ const currentAccountRunning = computed(() => (
 
 const operating = ref(false)
 const fertilizingLandId = ref<number | null>(null)
+const farmingLandId = ref<number | null>(null)
 const manualRefreshing = ref(false)
 const refreshIconClass = 'i-carbon-renew'
 const confirmVisible = ref(false)
@@ -74,6 +83,37 @@ const selectedInteractionItem = computed<FriendInteractionItemDto | null>(() => 
 
 const showManualFertilizerButtons = computed(() => settings.value.automation?.show_manual_fertilizer !== false)
 
+const cleanableFarmSocialEvents = computed(() => (
+  (Array.isArray(socialEvents.value) ? socialEvents.value : []).filter((event: any) => event?.cleanable)
+))
+const cleanableFarmSocialEventNames = computed(() => cleanableFarmSocialEvents.value
+  .map((event: any) => String(event?.itemName || event?.itemId || '').trim())
+  .filter(Boolean)
+  .join('、'))
+
+function isValidFarmingLand(land: any) {
+  return !!land?.unlocked
+    && !land?.occupiedByMaster
+    && !!String(land?.plantName || '').trim()
+    && !['locked', 'empty'].includes(String(land?.status || ''))
+}
+
+const socialCleanupLandId = computed(() => {
+  if (cleanableFarmSocialEvents.value.length === 0)
+    return 0
+  return Number(lands.value.find(isValidFarmingLand)?.id) || 0
+})
+
+function isLandFarmingCandidate(land: any) {
+  if (!isValidFarmingLand(land))
+    return false
+  return !!land?.needWater
+    || !!land?.needWeed
+    || !!land?.needBug
+    || !!land?.needInteractionCleanup
+    || Number(land?.id) === socialCleanupLandId.value
+}
+
 async function executeOperate() {
   if (!currentAccountId.value || !confirmConfig.value.opType)
     return
@@ -93,7 +133,7 @@ function handleOperate(opType: string) {
 
   const confirmMap: Record<string, string> = {
     harvest: '确定要收获所有成熟作物吗？',
-    clear: '确定要一键务农吗？（除草、除虫、浇水并清理黄金虫/足球）',
+    clear: '确定要一键务农吗？',
     plant: '确定要一键种植吗？(根据策略配置)',
     upgrade: '确定要升级所有可升级的土地吗？(消耗金币)',
     all: '确定要一键全收吗？(包含收获、除草、种植等)',
@@ -217,15 +257,13 @@ function isFertilizeCandidate(land: any) {
     && Number(land?.matureInSec) > 0
 }
 
-function canOrganicFertilize(land: any) {
-  const left = land?.leftInorcFertTimes
-  return left == null || Number(left) > 0
+function canNormalFertilize(land: any) {
+  return Number(land?.leftInorcFertTimes) > 0
 }
 
-function organicFertilizerLabel(land: any) {
-  const left = land?.leftInorcFertTimes
-  if (left != null && Number(left) <= 0)
-    return '已无法再施有机肥'
+function normalFertilizerLabel(land: any) {
+  if (!canNormalFertilize(land))
+    return '本季已施过普通化肥'
   return ''
 }
 
@@ -239,8 +277,8 @@ function formatFertilizerRemaining(sec: number) {
 async function handleFertilize(land: any, fertilizerType: FertilizerType) {
   if (!currentAccountId.value || fertilizePending.value || !isFertilizeCandidate(land))
     return
-  if (fertilizerType === 'organic' && !canOrganicFertilize(land)) {
-    toast.info('该地块已无法再施有机肥')
+  if (fertilizerType === 'normal' && !canNormalFertilize(land)) {
+    toast.info('本季已施过普通化肥')
     return
   }
 
@@ -259,6 +297,29 @@ async function handleFertilize(land: any, fertilizerType: FertilizerType) {
   finally {
     if (fertilizingLandId.value === landId)
       fertilizingLandId.value = null
+  }
+}
+
+async function handleFarmLand(land: any) {
+  if (!currentAccountId.value || farmingLandId.value !== null || operating.value || !isLandFarmingCandidate(land))
+    return
+  const landId = Number(land?.id) || 0
+  if (!landId)
+    return
+  farmingLandId.value = landId
+  try {
+    const result = await farmStore.operate(currentAccountId.value, 'clear', landId)
+    if (result?.hadWork)
+      toast.success(`第 ${landId} 块土地务农完成`)
+    else
+      toast.info(`第 ${landId} 块土地当前无需务农`)
+  }
+  catch (cause: any) {
+    toast.error(getApiErrorMessage(cause, '单点务农失败'))
+  }
+  finally {
+    if (farmingLandId.value === landId)
+      farmingLandId.value = null
   }
 }
 
@@ -338,6 +399,7 @@ async function refreshFarm() {
 watch(currentAccountId, () => {
   farmStore.resetLandState()
   fertilizingLandId.value = null
+  farmingLandId.value = null
   selectedInteractionItemId.value = ''
   selectedInteractionLandIds.value = {}
   lastInteractionResults.value = {}
@@ -411,7 +473,7 @@ onUnmounted(() => {
             v-for="op in operations"
             :key="op.type"
             :type="op.buttonType"
-            :disabled="operating || !currentAccountRunning"
+            :disabled="operating || farmingLandId !== null || !currentAccountRunning"
             @click="handleOperate(op.type)"
           >
             <span :class="op.icon" />
@@ -505,6 +567,13 @@ onUnmounted(() => {
         </div>
 
         <div v-else>
+          <div v-if="cleanableFarmSocialEvents.length > 0" class="mb-4 flex flex-wrap items-center justify-between gap-2 border border-emerald-200 rounded-xl bg-emerald-50/85 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-100">
+            <span class="flex items-center gap-2">
+              <span class="i-carbon-pedestrian-child" />
+              好友放置了 {{ cleanableFarmSocialEventNames }}，可一键务农或点击下方标记地块的“务农”清理。
+            </span>
+          </div>
+
           <div v-if="interactionItemsLoading || interactionItemsError || interactionItems.length > 0" class="mb-4 border border-amber-200 rounded-xl bg-amber-50/80 p-3 dark:border-amber-800 dark:bg-amber-950/25">
             <div v-if="interactionItemsLoading" class="flex items-center justify-center gap-2 py-2 text-sm text-amber-700 dark:text-amber-300">
               <span class="i-svg-spinners-90-ring-with-bg" />
@@ -581,22 +650,30 @@ onUnmounted(() => {
               v-for="land in lands"
               :key="land.id"
               :land="land"
+              show-details
               :selectable="!!selectedInteractionItem"
               :selected="isInteractionLandSelected(land)"
               :selection-disabled="isInteractionLandDisabled(land)"
               :selection-label="interactionLandSelectionLabel(land)"
               :show-fertilizer-actions="showManualFertilizerButtons && isFertilizeCandidate(land)"
               :fertilizer-pending="fertilizePending && fertilizingLandId === land.id"
-              :normal-fertilizer-disabled="fertilizePending"
-              :organic-fertilizer-disabled="fertilizePending || !canOrganicFertilize(land)"
-              :organic-fertilizer-label="organicFertilizerLabel(land)"
+              :normal-fertilizer-disabled="fertilizePending || !canNormalFertilize(land)"
+              :normal-fertilizer-label="normalFertilizerLabel(land)"
+              :organic-fertilizer-disabled="fertilizePending"
+              :show-farming-action="isLandFarmingCandidate(land)"
+              :farming-pending="farmingLandId === land.id"
+              :farming-disabled="farmingLandId !== null || operating"
+              @details="detailLandId = $event.id"
               @select="toggleInteractionLand(land)"
               @fertilize="handleFertilize"
+              @farm="handleFarmLand"
             />
           </div>
         </div>
       </div>
     </div>
+
+    <LandDetailModal :land="detailLand" :player="status?.status" :connected="currentAccountConnected" @close="detailLandId = null" />
 
     <ConfirmModal
       :show="confirmVisible"

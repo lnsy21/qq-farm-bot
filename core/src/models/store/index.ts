@@ -14,6 +14,7 @@ module.exports = {
     getPreferredSeed: accountConfig.getPreferredSeed,
     getPlantingStrategy: accountConfig.getPlantingStrategy,
     getBagSeedPriority: accountConfig.getBagSeedPriority,
+    getBagSeedMultiLandReservationEnabled: accountConfig.getBagSeedMultiLandReservationEnabled,
     getBagSeedLandTypes: accountConfig.getBagSeedLandTypes,
     getBagSeedFallbackStrategy: accountConfig.getBagSeedFallbackStrategy,
     getIntervals: accountConfig.getIntervals,
@@ -47,6 +48,8 @@ module.exports = {
     // Global config
     getUI: globalConfig.getUI,
     setUITheme: globalConfig.setUITheme,
+    getLoginSettings: globalConfig.getLoginSettings,
+    setLoginSettings: globalConfig.setLoginSettings,
     getOfflineReminder: globalConfig.getOfflineReminder,
     setOfflineReminder: globalConfig.setOfflineReminder,
 

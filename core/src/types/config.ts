@@ -85,6 +85,8 @@ export interface AccountConfig {
   fertilizerBuyNormalThresholdHours: number;
   fertilizerBuyCheckIntervalMinutes: number;
   bagSeedPriority: number[];
+  /** 是否为明确排在前面的多格背包种子保留尚未连成布局的空地。 */
+  bagSeedMultiLandReservationEnabled: boolean;
   /** seedId -> 允许种植的土地类型。缺 key 视为不限制。 */
   bagSeedLandTypes: Record<string, FertilizerLandType[]>;
   bagSeedFallbackStrategy: BagSeedFallbackStrategy;
@@ -107,6 +109,13 @@ export interface OfflineReminder {
 
 export interface UIConfig {
   theme: 'light' | 'dark';
+}
+
+export interface LoginSettings {
+  wechatQrLogin: boolean;
+  qqQrLogin: boolean;
+  napCatEndpoint: string;
+  napCatSignature: string;
 }
 
 export interface DeviceInfo {
@@ -133,6 +142,7 @@ export interface GlobalConfig {
   accountConfigs: Record<string, AccountConfig>;
   defaultAccountConfig: AccountConfig;
   ui: UIConfig;
+  loginSettings: LoginSettings;
   offlineReminder: OfflineReminder;
   systemConfig: SystemConfig | null;
 }

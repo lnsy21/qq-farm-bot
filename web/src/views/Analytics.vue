@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { NButton, NInputNumber, NTab, NTabs } from 'naive-ui'
+import { NButton } from 'naive-ui/es/button'
+import { NInputNumber } from 'naive-ui/es/input-number'
+import { NTab, NTabs } from 'naive-ui/es/tabs'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, ref, watch } from 'vue'
 import api from '@/api'
@@ -373,7 +375,7 @@ function getSeedNameById(seedId: number) {
                   v-model:value="strategyLevel"
                   class="w-24"
                   :min="1"
-                  :max="100"
+                  :max="200"
                   :show-button="false"
                   size="small"
                 />

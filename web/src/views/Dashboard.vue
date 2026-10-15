@@ -2,7 +2,8 @@
 import { useIntervalFn } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import api from '@/api'
+import api, { getApiErrorMessage } from '@/api'
+import LevelForecast from '@/components/LevelForecast.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
@@ -134,34 +135,12 @@ const displayName = computed(() => {
 // Exp Rate & Time to Level
 const expRate = computed(() => {
   const gain = status.value?.sessionExpGained || 0
-  const uptime = status.value?.uptime || 0
+  const uptime = status.value?.sessionElapsedSeconds ?? status.value?.uptime ?? 0
   if (!uptime)
     return '0/时'
   const hours = uptime / 3600
   const rate = hours > 0 ? (gain / hours) : 0
   return `${Math.floor(rate)}/时`
-})
-
-const timeToLevel = computed(() => {
-  const gain = status.value?.sessionExpGained || 0
-  const uptime = status.value?.uptime || 0
-  const current = status.value?.levelProgress?.current || 0
-  const needed = status.value?.levelProgress?.needed || 0
-
-  if (!needed || !uptime || gain <= 0)
-    return ''
-
-  const hours = uptime / 3600
-  const ratePerHour = hours > 0 ? (gain / hours) : 0
-  if (ratePerHour <= 0)
-    return ''
-
-  const expNeeded = needed - current
-  const minsToLevel = expNeeded / (ratePerHour / 60)
-
-  if (minsToLevel < 60)
-    return `约 ${Math.ceil(minsToLevel)} 分钟后升级`
-  return `约 ${(minsToLevel / 60).toFixed(1)} 小时后升级`
 })
 
 // Fertilizer & Collection
@@ -433,11 +412,11 @@ async function clearLogs() {
       await refresh(true)
     }
     else {
-      toastStore.error(`清空失败: ${data?.error || '未知错误'}`)
+      toastStore.error(`清空失败: ${getApiErrorMessage(data, '未知错误')}`)
     }
   }
   catch (e: any) {
-    const msg = e?.response?.data?.error || e?.message || '请求失败'
+    const msg = getApiErrorMessage(e, '请求失败')
     toastStore.error(`清空失败: ${msg}`)
   }
   finally {
@@ -520,9 +499,9 @@ useIntervalFn(updateCountdowns, 1000)
             />
           </div>
           <div class="mt-2 flex justify-between text-xs text-gray-400">
-            <span>效率: {{ expRate }}</span>
-            <span>{{ timeToLevel }}</span>
+            <span>会话效率: {{ expRate }}</span>
           </div>
+          <LevelForecast v-if="status?.connection?.connected" :forecast="status?.levelForecast" />
         </div>
       </div>
 

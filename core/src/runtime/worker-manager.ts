@@ -1,6 +1,18 @@
 export {};
 const { createScheduler } = require('../services/scheduler');
 
+const DEFAULT_API_CALL_TIMEOUT_MS = 10000;
+// 好友现场天气需要逐个 Enter/Leave，单批最多 5 位好友；
+// 好友列表只读缓存或拉一次名单，给的余量少一些。
+const API_CALL_TIMEOUTS_MS: Record<string, number> = {
+    getPetDiary: 90000,
+    operatePetDiary: 180000,
+    getPetDiaryRecords: 30000,
+    getPetDiaryFriend: 30000,
+    scanWeatherFriends: 60000,
+    getWeatherFriends: 30000,
+};
+
 interface WorkerManagerOptions {
     fork: any;
     WorkerThread: any;
@@ -226,11 +238,13 @@ function createWorkerManager(options: WorkerManagerOptions) {
         });
     }
 
-    function errorFromWorkerPayload(payload: any): Error & { code?: string | number } {
+    function errorFromWorkerPayload(payload: any): Error & { code?: string | number; errorMessage?: string } {
         if (!payload || typeof payload !== 'object') return new Error(String(payload || 'Worker API error'));
-        const error: Error & { code?: string | number } = new Error(String(payload.message || 'Worker API error'));
+        const error: Error & { code?: string | number; errorMessage?: string } = new Error(String(payload.message || 'Worker API error'));
         if (payload.name) error.name = String(payload.name);
         if (payload.code !== undefined && payload.code !== null && payload.code !== '') error.code = payload.code;
+        const protocolMessage = payload.errorMessage ?? payload.error_message;
+        if (protocolMessage !== undefined && protocolMessage !== null) error.errorMessage = String(protocolMessage);
         return error;
     }
 
@@ -351,14 +365,16 @@ function createWorkerManager(options: WorkerManagerOptions) {
             if (worker.terminalHandled) return;
             worker.terminalHandled = true;
             const reason = msg.reason || '未知';
-            log('系统', `账号 ${worker.name} 被踢下线，已自动停止账号`, { accountId: String(accountId), accountName: worker.name });
+            const reasonCode = Number(msg.reasonCode) || 0;
+            const diagnostics = msg.diagnostics || null;
+            log('系统', `账号 ${worker.name} 被踢下线，已自动停止账号`, { accountId: String(accountId), accountName: worker.name, reasonCode, diagnostics });
             triggerOfflineReminder({
                 accountId,
                 accountName: worker.name,
                 reason: `kickout:${reason}`,
                 offlineMs: 0,
             });
-            addAccountLog('kickout_stop', `账号 ${worker.name} 被踢下线，已自动停止`, accountId, worker.name, { reason });
+            addAccountLog('kickout_stop', `账号 ${worker.name} 被踢下线，已自动停止`, accountId, worker.name, { reason, reasonCode, diagnostics });
             stopWorker(accountId);
         } else if (msg.type === 'account_disconnected') {
             if (worker.terminalHandled) return;
@@ -379,8 +395,10 @@ function createWorkerManager(options: WorkerManagerOptions) {
                 accountId: String(accountId),
                 accountName: worker.name,
                 source,
-                code,
+                disconnectCode: code,
                 phase,
+                reason,
+                diagnostics: msg.diagnostics || null,
             });
             triggerOfflineReminder({
                 accountId,
@@ -393,7 +411,7 @@ function createWorkerManager(options: WorkerManagerOptions) {
                 `账号 ${worker.name} 连接已断开，已停止运行并等待 Helper 刷新 Code 或重新扫码`,
                 accountId,
                 worker.name,
-                { source, code, reason, phase, connectionId: Number(msg.connectionId) || 0 },
+                { source, disconnectCode: code, reason, phase, connectionId: Number(msg.connectionId) || 0, diagnostics: msg.diagnostics || null },
             );
             stopWorker(accountId);
         } else if (msg.type === 'api_response') {
@@ -472,7 +490,8 @@ function createWorkerManager(options: WorkerManagerOptions) {
             const id = worker.reqId++;
             worker.requests.set(id, { resolve, reject });
 
-            managerScheduler.setTimeoutTask(`api_timeout_${accountId}_${id}`, 10000, () => {
+            const timeoutMs = API_CALL_TIMEOUTS_MS[method] || DEFAULT_API_CALL_TIMEOUT_MS;
+            managerScheduler.setTimeoutTask(`api_timeout_${accountId}_${id}`, timeoutMs, () => {
                 if (worker.requests.has(id)) {
                     worker.requests.delete(id);
                     reject(new Error('API Timeout'));

@@ -4,12 +4,15 @@ const {
     getItemById,
     getItemImageById,
     getPlantBySeedId,
+    getPlantByFruitId,
     getPlantNameBySeedId,
     getIllustratedTypeByParam,
     getIllustratedSortByParam,
     getIllustratedBuffsByLevel,
     getIllustratedBuffs,
+    getAllSeeds,
 } = require('../config/gameConfig');
+const { getAvailableSeeds } = require('./farm');
 const protobuf = require('protobufjs');
 const { sendMsgAsync } = require('../utils/network');
 const { types } = require('../utils/proto');
@@ -115,18 +118,43 @@ function normalizeBook(type: number, listReply: any, levelReply: any): any {
     };
 }
 
-async function getIllustratedSnapshot(): Promise<any> {
-    const [cropList, cropLevels, mutantList, mutantLevels] = await Promise.all([
-        getIllustratedList(1),
-        getIllustratedLevels(1),
-        getIllustratedList(2),
-        getIllustratedLevels(2),
-    ]);
+let pendingSnapshot: Promise<any> | null = null;
+
+async function buildIllustratedSnapshot(): Promise<any> {
+    // 按官方客户端顺序串行请求：normal 优先级只有 2 个并发槽，一次性并发 4 个请求
+    // 会把自己的请求挤进队列并触发网关压力告警。
+    const cropList = await getIllustratedList(1);
+    const cropLevels = await getIllustratedLevels(1);
+    const mutantList = await getIllustratedList(2);
+    const mutantLevels = await getIllustratedLevels(2);
+    const crop = normalizeBook(1, cropList, cropLevels);
+    const seeds = await getAvailableSeeds();
+    const seedById = new Map(seeds.map((seed: any) => [toNum(seed.seedId), seed]));
+    const localSeeds = new Map(getAllSeeds().map((seed: any) => [toNum(seed.seedId), seed]));
+    crop.items = crop.items.map((item: any) => {
+        const itemId = toNum(item.seedId);
+        const plant = getPlantBySeedId(itemId) || getPlantByFruitId(itemId);
+        const seedId = toNum(plant && plant.seed_id) || itemId;
+        const shopSeed: any = seedById.get(seedId);
+        const localSeed: any = localSeeds.get(seedId);
+        return { ...item, seedId, shopSeed: shopSeed || (localSeed ? { ...localSeed, goodsId: 0, price: null, unknownMeta: true, requiresUnlockCard: false } : null) };
+    });
     return {
-        crop: normalizeBook(1, cropList, cropLevels),
+        crop,
         mutant: normalizeBook(2, mutantList, mutantLevels),
         updatedAt: Date.now(),
     };
+}
+
+// 面板重复打开或多个请求并发时合并为同一轮读取，避免重复发起 4 个 RPC。
+function getIllustratedSnapshot(): Promise<any> {
+    if (pendingSnapshot) return pendingSnapshot;
+    const request = buildIllustratedSnapshot();
+    pendingSnapshot = request;
+    request.finally(() => {
+        if (pendingSnapshot === request) pendingSnapshot = null;
+    }).catch(() => {});
+    return request;
 }
 
 module.exports = {

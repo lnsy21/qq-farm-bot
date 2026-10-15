@@ -20,6 +20,9 @@ function friendlyError(error: any): { code: string; message: string } {
     const raw = String(error?.message || error || '操作失败');
     const code = String(error?.code || raw.match(/\bcode=(\d+)\b/)?.[1] || 'COMMERCE_OPERATION_FAILED');
     if (ERROR_MESSAGES[code]) return { code, message: ERROR_MESSAGES[code] };
+    const protocolMessage = String(error?.errorMessage || '').trim()
+        || raw.match(/\bcode=\d+\b\s*(.*)$/)?.[1]?.trim();
+    if (protocolMessage) return { code, message: protocolMessage };
     if (raw.includes('账号未运行') || raw.includes('账号已离线') || raw.includes('连接未打开') || raw.includes('账号尚未登录')) {
         return { code: 'ACCOUNT_OFFLINE', message: '当前账号尚未运行，请启动账号后重试' };
     }
@@ -39,17 +42,24 @@ function mountCommerceRoutes(app: Application, ctx: AdminContext): void {
                 return res.json({ ok: true, data });
             } catch (error: any) {
                 const result = friendlyError(error);
-                return res.json({ ok: false, error: result.message, errorCode: result.code });
+                return res.json({ ok: false, error: result.message, errorMessage: result.message, errorCode: result.code });
             }
         };
     };
+
+    app.get('/api/activities/autumn/:key', withAccount((accountId: string, req: Request) => (
+        ctx.provider.getAutumnActivity(accountId, req.params.key)
+    )));
+    app.post('/api/activities/autumn/:key/:action', withAccount((accountId: string, req: Request) => (
+        ctx.provider.operateAutumnActivity(accountId, req.params.key, req.params.action, req.body)
+    )));
 
     app.get('/api/game-mall', withAccount((accountId: string, req: Request) => (
         ctx.provider.getMallCatalog(accountId, req.query.slotType, req.query.subSlotType)
     )));
 
     app.post('/api/game-mall/purchase', withAccount((accountId: string, req: Request) => (
-        ctx.provider.purchaseMallProduct(accountId, req.body?.goodsId, req.body?.count)
+        ctx.provider.purchaseMallProduct(accountId, req.body?.goodsId, req.body?.count, req.body?.slotType, req.body?.expectedPrice)
     )));
 
     app.get('/api/mystery-shop', withAccount((accountId: string) => (

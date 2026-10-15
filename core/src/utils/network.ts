@@ -3,15 +3,32 @@ const { Buffer } = require('node:buffer');
 const { EventEmitter } = require('node:events');
 const WebSocket = require('ws');
 const { CONFIG } = require('../config/config');
+const { getClientVersion, getLoginDeviceInfo, isWechatPlatform } = require('./client-profile');
 const { createScheduler } = require('../services/scheduler');
 const { updateStatusFromLogin, updateStatusGold, updateStatusLevel } = require('../services/status');
 const { recordOperation } = require('../services/stats');
+const { invalidateLandForecast } = require('../services/level-forecast');
 const { types } = require('./proto');
-const { toLong, toNum, syncServerTime, log, logWarn } = require('./utils');
+const { toLong, toNum, syncServerTime, log, logWarn, sleep } = require('./utils');
 const cryptoWasm = require('./crypto-wasm');
 const { GatewayTokenProvider } = require('./gateway-token');
 const { MAX_HEARTBEAT_MISSES, shouldTerminateForHeartbeat } = require('./keepalive-policy');
-const { startAceRuntime, stopAceRuntime } = require('../services/ace');
+const { countBlockingQueuedRequests, shouldLogRequestPressure } = require('./request-pressure');
+const {
+    LOW_PRIORITY_IDLE_POLL_MS,
+    LOW_PRIORITY_IDLE_WAIT_MAX_MS,
+    LOW_PRIORITY_QUEUE_WAIT_MS,
+    isGatewayIdleForLowPriority,
+} = require('./low-priority-gate');
+const {
+    describeRequestClassMarker,
+    isClassQueueFull,
+    maxQueuedForClass,
+    resolveRequestClass,
+    selectDispatchIndex,
+} = require('./request-priority');
+const { getAmbientRequestClass } = require('./request-context');
+const { startAceRuntime, stopAceRuntime, getAceDiagnostics } = require('../services/ace');
 
 // ============ 事件发射器 (用于推送通知) ============
 const networkEvents = new EventEmitter();
@@ -19,6 +36,8 @@ const networkEvents = new EventEmitter();
 // ============ 内部状态 ============
 type ConnectionPhase = 'connecting' | 'login' | 'online';
 type RequestPriority = 'low' | 'normal' | 'high';
+/** 请求班次，见 utils/request-priority.ts。 */
+type RequestClass = 'critical' | 'foreground' | 'farm' | 'friend' | 'background';
 type CriticalLane = 'heartbeat' | 'ace';
 
 interface ConnectionContext {
@@ -28,12 +47,18 @@ interface ConnectionContext {
     intentionalClose: boolean;
     finalized: boolean;
     loginInitialized: boolean;
+    startedAt?: number;
+    onlineAt?: number;
+    heartbeat?: { attempts: number; replies: number; failures: number };
 }
 
 interface SendMsgOptions {
     timeoutMs?: number;
     expectedErrorCodes?: readonly number[];
+    /** 兼容旧调用：high→critical、low→background、normal 视为「未表态」交给环境班次。 */
     priority?: RequestPriority;
+    /** 显式指定班次，优先于 priority 与环境班次。 */
+    requestClass?: RequestClass;
     criticalLane?: CriticalLane;
     expectReply?: boolean;
 }
@@ -44,7 +69,7 @@ interface PendingRequest {
     serviceName?: string;
     methodName?: string;
     startedAt?: number;
-    priority?: RequestPriority;
+    requestClass: RequestClass;
     criticalLane?: CriticalLane;
 }
 
@@ -57,10 +82,12 @@ interface QueuedRequest {
     resolve: (value: { body: Buffer; meta: any }) => void;
     reject: (reason: Error) => void;
     timeoutKey: string;
+    queueWaitKey: string;
     seq: number | null;
     settled: boolean;
-    priority: RequestPriority;
+    requestClass: RequestClass;
     criticalLane?: CriticalLane;
+    enqueuedAt: number;
     expectReply: boolean;
 }
 
@@ -86,6 +113,14 @@ class GatewayError extends Error {
     }
 }
 
+/** background 班次请求让路时抛出的错误：不是业务失败，而是「现在不该占用连接」。 */
+class GatewayBusyError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'GatewayBusyError';
+    }
+}
+
 let ws: WebSocket | null = null;
 let currentConnection: ConnectionContext | null = null;
 let nextConnectionId = 1;
@@ -93,14 +128,9 @@ let clientSeq: number = 1;
 let serverSeq: number = 0;
 const pendingCallbacks = new Map<number, PendingRequest>();
 const requestQueue: QueuedRequest[] = [];
-// Gateway 是单连接复用：普通业务保守并发，心跳和 ACE 各保留一个独立关键槽位。
-const MAX_NORMAL_IN_FLIGHT_REQUESTS = 2;
-const MAX_HIGH_IN_FLIGHT_REQUESTS = 2;
-const MAX_LOW_IN_FLIGHT_REQUESTS = 1;
-// 普通/关键流量的总预算；低优先级另有独立 1 个槽位，不占用该预算。
-const MAX_IN_FLIGHT_REQUESTS = MAX_NORMAL_IN_FLIGHT_REQUESTS + MAX_HIGH_IN_FLIGHT_REQUESTS;
-const MAX_QUEUED_REQUESTS = 100;
-const MAX_HIGH_PRIORITY_QUEUED_REQUESTS = 10;
+// Gateway 是单连接复用，并发预算与班次优先级全部集中在 utils/request-priority.ts。
+// 这里只保留日志里要展示多少条在途请求。
+const MAX_DESCRIBED_PENDING_REQUESTS = 6;
 let nextRequestId = 1;
 let wsErrorState = { code: 0, at: 0, message: '' };
 let lastRequestPressureLogAt = 0;
@@ -114,48 +144,94 @@ function settleQueuedRequest(request: QueuedRequest, error?: Error, value?: { bo
     if (request.settled) return;
     request.settled = true;
     networkScheduler.clear(request.timeoutKey);
+    networkScheduler.clear(request.queueWaitKey);
     if (error) request.reject(error);
     else request.resolve(value!);
 }
 
-function pendingPriorityCount(priority: RequestPriority): number {
+function pendingClassCount(requestClass: RequestClass): number {
     let count = 0;
     for (const pending of pendingCallbacks.values()) {
-        if ((pending.priority || 'normal') === priority) count += 1;
+        if (pending.requestClass === requestClass) count += 1;
     }
     return count;
 }
 
-function pendingCriticalLaneCount(lane: CriticalLane): number {
-    let count = 0;
-    for (const pending of pendingCallbacks.values()) {
-        if (pending.priority === 'high' && pending.criticalLane === lane) count += 1;
-    }
-    return count;
+function pendingBusinessCount(): number {
+    return pendingClassCount('foreground') + pendingClassCount('farm') + pendingClassCount('friend');
 }
 
+interface GatewayLoad {
+    pending: number;
+    queued: number;
+    /** 队列里非 background 的请求数：只有这些代表「有人真的在等连接」。 */
+    blockingQueued: number;
+    criticalPending: number;
+    businessPending: number;
+    foregroundPending: number;
+    backgroundPending: number;
+    heartbeatMisses: number;
+    oldestPendingAgeMs: number;
+}
+
+function oldestPendingAgeMs(): number {
+    const now = Date.now();
+    let oldest = 0;
+    for (const pending of pendingCallbacks.values()) {
+        if (!pending.startedAt) continue;
+        const age = Math.max(0, now - pending.startedAt);
+        if (age > oldest) oldest = age;
+    }
+    return oldest;
+}
+
+/** 后台任务用来判断「现在该不该占用连接」的负载快照。 */
+function getGatewayLoad(): GatewayLoad {
+    return {
+        pending: pendingCallbacks.size,
+        queued: requestQueue.length,
+        blockingQueued: countBlockingQueuedRequests(requestQueue),
+        criticalPending: pendingClassCount('critical'),
+        businessPending: pendingBusinessCount(),
+        foregroundPending: pendingClassCount('foreground'),
+        backgroundPending: pendingClassCount('background'),
+        heartbeatMisses: heartbeatMissCount,
+        oldestPendingAgeMs: oldestPendingAgeMs(),
+    };
+}
+
+function isGatewayIdleForBackground(): boolean {
+    return isGatewayIdleForLowPriority(getGatewayLoad());
+}
+
+/**
+ * 等网关空闲到可以插入后台请求；等不到就返回 false，由调用方整轮让路。
+ * 只观察不排队，所以等待期间一点压力都不加给网关。
+ */
+async function waitForGatewayIdle(
+    maxWaitMs: number = LOW_PRIORITY_IDLE_WAIT_MAX_MS,
+    pollMs: number = LOW_PRIORITY_IDLE_POLL_MS,
+): Promise<boolean> {
+    const deadline = Date.now() + Math.max(0, Number(maxWaitMs) || 0);
+    for (;;) {
+        if (isGatewayIdleForBackground()) return true;
+        if (Date.now() >= deadline) return false;
+        await sleep(Math.max(20, Number(pollMs) || LOW_PRIORITY_IDLE_POLL_MS));
+    }
+}
+
+/**
+ * 挑出下一个可发送的请求。分层与容量规则全部在 utils/request-priority.ts 里，
+ * 这里只负责清掉已结算的队列项、把选中项摘出来。
+ */
 function takeDispatchableRequest(): QueuedRequest | null {
     for (let index = requestQueue.length - 1; index >= 0; index--) {
         if (requestQueue[index].settled) requestQueue.splice(index, 1);
     }
-    // 两类关键流量各占一个槽位，避免 AntiData 或未来新增的高优先级请求挤掉心跳。
-    for (const lane of ['heartbeat', 'ace'] as const) {
-        if (pendingCriticalLaneCount(lane) >= 1) continue;
-        const laneIndex = requestQueue.findIndex(request => request.priority === 'high' && request.criticalLane === lane);
-        if (laneIndex >= 0) return requestQueue.splice(laneIndex, 1)[0];
-    }
-    // 未标记关键通道的 high 请求不占用心跳/ACE 的保留槽位；当前业务没有此类请求。
-    if (pendingPriorityCount('normal') < MAX_NORMAL_IN_FLIGHT_REQUESTS) {
-        const normalIndex = requestQueue.findIndex(request => request.priority === 'normal');
-        if (normalIndex >= 0) return requestQueue.splice(normalIndex, 1)[0];
-    }
-    // 低优先级任务不能挤占任何高/普通请求；只有网关当前没有主流程请求时才发送。
-    if (requestQueue.some(request => request.priority !== 'low')) return null;
-    if (pendingPriorityCount('high') > 0 || pendingPriorityCount('normal') > 0) return null;
-    if (pendingPriorityCount('low') >= MAX_LOW_IN_FLIGHT_REQUESTS) return null;
-    const lowIndex = requestQueue.findIndex(request => request.priority === 'low');
-    if (lowIndex >= 0) return requestQueue.splice(lowIndex, 1)[0];
-    return null;
+    if (requestQueue.length === 0) return null;
+    const index = selectDispatchIndex(requestQueue, Array.from(pendingCallbacks.values()), Date.now());
+    if (index < 0) return null;
+    return requestQueue.splice(index, 1)[0];
 }
 
 function drainRequestQueue(): void {
@@ -174,7 +250,7 @@ function drainRequestQueue(): void {
             serviceName: request.serviceName,
             methodName: request.methodName,
             startedAt: Date.now(),
-            priority: request.priority,
+            requestClass: request.requestClass,
             criticalLane: request.criticalLane,
             expectedErrorCodes: request.expectedErrorCodes,
             callback: (err, body, meta) => {
@@ -225,7 +301,7 @@ function describePendingRequests(): string {
     if (pendingCallbacks.size === 0) return 'none';
     const now = Date.now();
     return Array.from(pendingCallbacks.entries())
-        .slice(0, MAX_IN_FLIGHT_REQUESTS)
+        .slice(0, MAX_DESCRIBED_PENDING_REQUESTS)
         .map(([seq, pending]) => {
             const method = pending.methodName || 'unknown';
             const ageMs = pending.startedAt ? Math.max(0, now - pending.startedAt) : 0;
@@ -238,19 +314,13 @@ function describeQueuedRequests(): string {
     if (requestQueue.length === 0) return 'none';
     return requestQueue
         .slice(0, 8)
-        .map((request) => {
-            const marker = request.criticalLane === 'heartbeat'
-                ? '!H:'
-                : request.criticalLane === 'ace' ? '!A:' : request.priority === 'high' ? '!' : request.priority === 'low' ? '~' : '';
-            return `${marker}${request.methodName || 'unknown'}`;
-        })
+        .map(request => `${describeRequestClassMarker(request)}${request.methodName || 'unknown'}`)
         .join(',');
 }
 
 function logRequestPressure(): void {
     const now = Date.now();
-    if (now - lastRequestPressureLogAt < 1000) return;
-    if (pendingCallbacks.size < MAX_IN_FLIGHT_REQUESTS && requestQueue.length === 0) return;
+    if (!shouldLogRequestPressure(requestQueue, now, lastRequestPressureLogAt)) return;
     lastRequestPressureLogAt = now;
     logWarn('系统', `Gateway 请求压力: pending=${pendingCallbacks.size}, queued=${requestQueue.length}, active=${describePendingRequests()}, queuedMethods=${describeQueuedRequests()}`);
 }
@@ -360,9 +430,11 @@ function sendMsgAsync(serviceName: string, methodName: string, bodyBytes: Buffer
         ? options.criticalLane
         : undefined;
     const expectReply = options.expectReply !== false;
-    const priority: RequestPriority = criticalLane || options.priority === 'high'
-        ? 'high'
-        : options.priority === 'low' ? 'low' : 'normal';
+    // 班次由「显式 requestClass > priority 兼容映射 > 调度器注入的环境班次 > 前台」决定。
+    const requestClass: RequestClass = resolveRequestClass(
+        { priority: options.priority, requestClass: options.requestClass, criticalLane },
+        getAmbientRequestClass(),
+    );
     return new Promise((resolve, reject) => {
         const context = currentConnection;
         if (!context || !isCurrentConnection(context) || context.socket.readyState !== WebSocket.OPEN) {
@@ -374,10 +446,12 @@ function sendMsgAsync(serviceName: string, methodName: string, bodyBytes: Buffer
             return;
         }
 
-        const highPriorityQueued = requestQueue.filter(request => request.priority === 'high').length;
-        if ((priority !== 'high' && requestQueue.length >= MAX_QUEUED_REQUESTS)
-            || (priority === 'high' && highPriorityQueued >= MAX_HIGH_PRIORITY_QUEUED_REQUESTS)) {
-            reject(new Error(`请求等待队列已满: ${methodName} (queued=${requestQueue.length}, pending=${pendingCallbacks.size})`));
+        // 每个班次有独立的排队配额：后台任务把自己的配额排满，也不会占掉前台/心跳的名额。
+        if (isClassQueueFull(requestQueue, requestClass)) {
+            reject(new Error(
+                `请求等待队列已满: ${methodName} (class=${requestClass}, limit=${maxQueuedForClass(requestClass)}, `
+                + `queued=${requestQueue.length}, pending=${pendingCallbacks.size})`,
+            ));
             return;
         }
 
@@ -391,10 +465,12 @@ function sendMsgAsync(serviceName: string, methodName: string, bodyBytes: Buffer
             resolve,
             reject,
             timeoutKey: `request_timeout_${requestId}`,
+            queueWaitKey: `request_queue_wait_${requestId}`,
             seq: null,
             settled: false,
-            priority,
+            requestClass,
             criticalLane,
+            enqueuedAt: Date.now(),
             expectReply,
         };
         requestQueue.push(request);
@@ -406,6 +482,20 @@ function sendMsgAsync(serviceName: string, methodName: string, bodyBytes: Buffer
             settleQueuedRequest(request, new Error(`请求超时: ${methodName} (stage=${stage}, pending=${pendingCallbacks.size}, queued=${requestQueue.length}, active=${describePendingRequests()})`));
             drainRequestQueue();
         });
+        if (requestClass === 'background') {
+            // background 是「后台补数据」：拿不到空闲槽位就早点让路，而不是一路熬到请求超时——
+            // 熬着既拖长队列，也会给调用方刷一堆看着像故障的超时日志。
+            const queueWaitMs = Math.min(timeoutMs, LOW_PRIORITY_QUEUE_WAIT_MS);
+            networkScheduler.setTimeoutTask(request.queueWaitKey, queueWaitMs, () => {
+                if (request.settled || request.seq !== null) return;
+                const index = requestQueue.indexOf(request);
+                if (index >= 0) requestQueue.splice(index, 1);
+                settleQueuedRequest(request, new GatewayBusyError(
+                    `网关繁忙，后台请求已让路: ${methodName} (waited=${queueWaitMs}ms, `
+                    + `pending=${pendingCallbacks.size}, queued=${requestQueue.length}, active=${describePendingRequests()})`,
+                ));
+            });
+        }
         drainRequestQueue();
         logRequestPressure();
     });
@@ -413,7 +503,8 @@ function sendMsgAsync(serviceName: string, methodName: string, bodyBytes: Buffer
 
 async function sendMsgNoReply(serviceName: string, methodName: string, bodyBytes: Buffer): Promise<void> {
     // 即使调用方不需要回包，也必须经过同一调度器，不能绕过心跳/ACE保护和并发上限。
-    await sendMsgAsync(serviceName, methodName, bodyBytes, { priority: 'normal', expectReply: false });
+    // 不写死班次，交给环境班次判定：后台任务发的通知不该被当成前台流量。
+    await sendMsgAsync(serviceName, methodName, bodyBytes, { expectReply: false });
 }
 
 // ============ 消息处理 ============
@@ -454,6 +545,10 @@ function handleMessage(data: Buffer): void {
                 if (errorCode !== 0) {
                     pending.callback(new GatewayError(meta));
                 } else {
+                    if ((meta.service_name === 'gamepb.plantpb.PlantService' && meta.method_name !== 'AllLands')
+                        || (meta.service_name === 'gamepb.itempb.ItemService' && meta.method_name === 'Use')) {
+                        invalidateLandForecast();
+                    }
                     pending.callback(null, msg.body, meta);
                 }
                 
@@ -476,10 +571,14 @@ function handleNotify(msg: any): void {
             log('推送', `被踢下线! ${type}`);
             try {
                 const notify = types.KickoutNotify.decode(eventBody);
-                log('推送', `原因: ${notify.reason_message || '未知'}`);
+                const reasonCode = toNum(notify.reason);
+                const diagnostics = getConnectionDiagnostics(currentConnection);
+                log('推送', `原因: ${notify.reason_message || '未知'} (${reasonCode})`, { reasonCode, diagnostics });
                 networkEvents.emit('kickout', {
                     type,
                     reason: notify.reason_message || '未知',
+                    reasonCode,
+                    diagnostics,
                 });
             } catch {}
             return;
@@ -493,9 +592,34 @@ function handleNotify(msg: any): void {
                 const lands = notify.lands || [];
                 if (lands.length > 0) {
                     if (hostGid === userState.gid || hostGid === 0) {
+                        invalidateLandForecast();
                         networkEvents.emit('landsChanged', lands);
                     }
                 }
+            } catch {}
+            return;
+        }
+
+        // 青蛙等农场级社交事件变化。与乌云不同，它不附着在 LandInfo 上。
+        if (type.includes('FarmSocialEventsNotify')) {
+            try {
+                const notify = types.FarmSocialEventsNotify.decode(eventBody);
+                const hostGid = toNum(notify.host_gid);
+                if (hostGid === userState.gid || hostGid === 0) {
+                    networkEvents.emit('farmSocialEventsChanged', notify.social_events || []);
+                }
+            } catch {}
+            return;
+        }
+
+        // 特殊天气变化。通知携带天气所属农场 GID；空 weather 表示天气结束。
+        if (type.includes('WeatherChangeNotify')) {
+            try {
+                const notify = types.WeatherChangeNotify.decode(eventBody);
+                networkEvents.emit('weatherChanged', {
+                    hostGid: toNum(notify.host_gid),
+                    weather: notify.weather || null,
+                });
             } catch {}
             return;
         }
@@ -724,26 +848,38 @@ function handleNotify(msg: any): void {
 }
 
 // ============ 登录 ============
-async function sendLogin(context: ConnectionContext, onLoginSuccess?: () => void): Promise<void> {
-    const di = CONFIG.deviceInfo || {};
-    const body = types.LoginRequest.encode(types.LoginRequest.create({
+// 官方 QQ 抓包（会话版本 1.14.0.4_20260911）的字段存在性：device_info 只写 client_version 和
+// sys_software，report_data 显式写出全部空字符串字段，extra 显式为空。protobufjs 按调用方是否
+// 赋值决定是否写默认值，所以这里必须保持字段集合与官方一致，不能只留非默认值。
+function buildLoginBody(): Buffer {
+    return Buffer.from(types.LoginRequest.encode(types.LoginRequest.create({
         sharer_id: toLong(0),
         sharer_open_id: '',
-        device_info: {
-            client_version: di.clientVersion || CONFIG.clientVersion,
-            sys_software: di.sysSoftware || 'Windows',
-            screen_width: 0,
-        },
+        device_info: getLoginDeviceInfo(),
         share_cfg_id: toLong(0),
-        scene_id: '1234567',
+        // WeChat launch scene is entry-dependent and unavailable from a standalone Code.
+        scene_id: isWechatPlatform() ? undefined : '1234567',
         report_data: {
-            minigame_channel: 'other-qq',
+            callback: '',
+            cd_extend_info: '',
+            click_id: '',
+            clue_token: '',
+            minigame_channel: isWechatPlatform() ? 'other' : 'other-qq',
             minigame_platid: 2,
+            req_id: '',
+            trackid: '',
         },
-    })).finish();
+        extra: Buffer.alloc(0),
+    })).finish());
+}
+
+async function sendLogin(context: ConnectionContext, onLoginSuccess?: () => void): Promise<void> {
+    const body = buildLoginBody();
 
     await sendMsg(context, 'gamepb.userpb.UserService', 'Login', body, {
         expectedErrorCodes: new Set(),
+        // 登录不走排队器（此时还没 online），按保命流量记账。
+        requestClass: 'critical',
         callback: async (err, bodyBytes, _meta) => {
         if (!isCurrentConnection(context)) return;
         if (err) {
@@ -813,6 +949,7 @@ async function sendLogin(context: ConnectionContext, onLoginSuccess?: () => void
             if (!isCurrentConnection(context)) return;
             networkScheduler.clear('login_timeout');
             context.phase = 'online';
+            context.onlineAt = Date.now();
             startAceRuntime((service: string, method: string, body: Buffer, timeoutMs?: number) => (
                 sendMsgAsync(service, method, body, { timeoutMs, priority: 'high', criticalLane: 'ace' })
             ));
@@ -836,8 +973,18 @@ async function sendLogin(context: ConnectionContext, onLoginSuccess?: () => void
 // ============ 心跳 ============
 const HEARTBEAT_REQUEST_TIMEOUT = 20000;
 
+function buildHeartbeatBody(gid: number): Buffer {
+    return Buffer.from(types.HeartbeatRequest.encode(types.HeartbeatRequest.create({
+        gid: toLong(gid),
+        client_version: getClientVersion(),
+        field_3: toLong(0),
+    })).finish());
+}
+
 function startHeartbeat(context: ConnectionContext): void {
     networkScheduler.clear('heartbeat_interval');
+    const heartbeat = { attempts: 0, replies: 0, failures: 0 };
+    context.heartbeat = heartbeat;
     lastHeartbeatResponse = Date.now();
     lastInboundAt = Date.now();
     heartbeatMissCount = 0;
@@ -845,11 +992,8 @@ function startHeartbeat(context: ConnectionContext): void {
     networkScheduler.setIntervalTask('heartbeat_interval', CONFIG.heartbeatInterval, async () => {
         if (!isCurrentConnection(context) || context.phase !== 'online' || !userState.gid) return;
 
-        const body = types.HeartbeatRequest.encode(types.HeartbeatRequest.create({
-            gid: toLong(userState.gid),
-            client_version: CONFIG.clientVersion,
-            field_3: toLong(0),
-        })).finish();
+        const body = buildHeartbeatBody(userState.gid);
+        heartbeat.attempts += 1;
         try {
             const { body: replyBody } = await sendMsgAsync(
                 'gamepb.userpb.UserService',
@@ -858,6 +1002,7 @@ function startHeartbeat(context: ConnectionContext): void {
                 { timeoutMs: HEARTBEAT_REQUEST_TIMEOUT, priority: 'high', criticalLane: 'heartbeat' },
             );
             if (!isCurrentConnection(context)) return;
+            heartbeat.replies += 1;
             lastHeartbeatResponse = Date.now();
             heartbeatMissCount = 0;
             try {
@@ -866,6 +1011,7 @@ function startHeartbeat(context: ConnectionContext): void {
             } catch {}
         } catch {
             if (!isCurrentConnection(context)) return;
+            heartbeat.failures += 1;
             heartbeatMissCount += 1;
             const now = Date.now();
             const inboundSilenceMs = Math.max(0, now - lastInboundAt);
@@ -900,8 +1046,27 @@ function clearNetworkRuntime(reason: string): void {
     networkScheduler.clearAll();
     stopAceRuntime(true);
     gatewayTokens.clear();
+    invalidateLandForecast();
     userState.gid = 0;
     userState.openId = '';
+}
+
+function getConnectionDiagnostics(context: ConnectionContext | null) {
+    return {
+        platform: CONFIG.platform,
+        clientVersion: getClientVersion(),
+        connectionAgeMs: context?.startedAt ? Math.max(0, Date.now() - context.startedAt) : 0,
+        onlineAgeMs: context?.onlineAt ? Math.max(0, Date.now() - context.onlineAt) : 0,
+        heartbeat: context?.heartbeat ? { ...context.heartbeat } : null,
+        ...getGatewayLoad(),
+        lastInboundAgeMs: Math.max(0, Date.now() - lastInboundAt),
+        lastHeartbeatAgeMs: Math.max(0, Date.now() - lastHeartbeatResponse),
+        heartbeatMissCount,
+        pendingRequests: describePendingRequests(),
+        queuedRequests: describeQueuedRequests(),
+        ace: context?.phase === 'online' ? getAceDiagnostics() : null,
+        tsdk: cryptoWasm.getDiagnostics(),
+    };
 }
 
 function finalizeConnection(context: ConnectionContext, details: DisconnectDetails): void {
@@ -909,7 +1074,18 @@ function finalizeConnection(context: ConnectionContext, details: DisconnectDetai
     context.finalized = true;
     const wasCurrent = currentConnection === context;
     const wasLoginReady = context.phase === 'online';
+    // Snapshot before cleanup destroys TSDK state and clears request queues.
+    const diagnostics = getConnectionDiagnostics(context);
     if (wasCurrent) {
+        log('连接', '会话结束', {
+            event: 'connection_summary',
+            connectionId: context.id,
+            source: details.source,
+            disconnectCode: Number(details.code) || 0,
+            phase: context.phase,
+            intentionalClose: context.intentionalClose,
+            diagnostics,
+        });
         currentConnection = null;
         ws = null;
         clearNetworkRuntime(details.reason || details.source);
@@ -922,6 +1098,7 @@ function finalizeConnection(context: ConnectionContext, details: DisconnectDetai
         reason: details.reason || '',
         phase: context.phase,
         wasLoginReady,
+        diagnostics,
         at: Date.now(),
     });
 }
@@ -934,11 +1111,14 @@ function connect(code: string | null, onLoginSuccess?: () => void): void {
 
     clientSeq = 1;
     serverSeq = 0;
+    lastInboundAt = Date.now();
+    lastHeartbeatResponse = Date.now();
+    heartbeatMissCount = 0;
     const url = new URL(CONFIG.serverUrl);
     url.search = new URLSearchParams({
         platform: CONFIG.platform,
         os: CONFIG.os,
-        ver: CONFIG.clientVersion,
+        ver: getClientVersion(),
         code: authCode,
     }).toString();
     const di = CONFIG.deviceInfo || {};
@@ -955,6 +1135,7 @@ function connect(code: string | null, onLoginSuccess?: () => void): void {
         intentionalClose: false,
         finalized: false,
         loginInitialized: false,
+        startedAt: Date.now(),
     };
     currentConnection = context;
     ws = socket;
@@ -1018,8 +1199,10 @@ function getWs(): WebSocket | null { return ws; }
 
 module.exports = {
     connect, cleanup, getWs,
+    buildLoginBody, buildHeartbeatBody,
     sendMsgAsync, sendMsgNoReply,
-    GatewayError,
+    getGatewayLoad, isGatewayIdleForBackground, waitForGatewayIdle,
+    GatewayError, GatewayBusyError,
     getUserState,
     getWsErrorState,
     networkEvents,

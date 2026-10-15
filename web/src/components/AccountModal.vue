@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { NCard, NModal, NRadio, NRadioGroup, NTab, NTabs } from 'naive-ui'
-import { onBeforeUnmount, reactive, ref, watch } from 'vue'
-import api from '@/api'
+import { NCard } from 'naive-ui/es/card'
+import { NModal } from 'naive-ui/es/modal'
+import { NRadio, NRadioGroup } from 'naive-ui/es/radio'
+import { NTab, NTabs } from 'naive-ui/es/tabs'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import api, { getApiErrorMessage } from '@/api'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseTextarea from '@/components/ui/BaseTextarea.vue'
@@ -16,7 +19,15 @@ const emit = defineEmits(['close', 'saved'])
 
 const loading = ref(false)
 const errorMessage = ref('')
-const activeLoginTab = ref<'code' | 'wx_qr'>('code')
+const activeLoginTab = ref<'code' | 'wx_qr' | 'qq_qr'>('code')
+const loginSettingsLoaded = ref(false)
+const loginSettings = ref({
+  wechatQrLogin: true,
+  qqQrLogin: false,
+  napCatEndpoint: '',
+  napCatSignature: '',
+})
+let loginSettingsRequestVersion = 0
 const wxTaskId = ref('')
 const wxStatus = ref('')
 const wxError = ref('')
@@ -28,6 +39,22 @@ let wxFlowVersion = 0
 let wxPollController: AbortController | undefined
 let wxPollInFlight: Promise<void> | undefined
 let wxPollKey = ''
+let wxPendingCode = ''
+const qqTaskId = ref('')
+const qqStatus = ref('')
+const qqError = ref('')
+const qqLoading = ref(false)
+const qqQrUrl = ref('')
+let qqPollTimer: ReturnType<typeof setTimeout> | undefined
+let qqFlowVersion = 0
+let qqPollController: AbortController | undefined
+let qqPollInFlight: Promise<void> | undefined
+let qqPollKey = ''
+let qqPendingCode = ''
+let qrNameSubmitTimer: ReturnType<typeof setTimeout> | undefined
+
+const wechatQrLoginEnabled = computed(() => loginSettingsLoaded.value && loginSettings.value.wechatQrLogin)
+const qqQrLoginEnabled = computed(() => loginSettingsLoaded.value && loginSettings.value.qqQrLogin)
 
 // 表单数据
 const form = reactive({
@@ -37,9 +64,9 @@ const form = reactive({
 })
 
 // 添加账号
-async function addAccount(data: any) {
+async function addAccount(data: any, isRelogin = false) {
   const name = String(data?.name || '').trim()
-  if (!name) {
+  if (!isRelogin && !name) {
     errorMessage.value = '请输入账号备注'
     return false
   }
@@ -54,11 +81,11 @@ async function addAccount(data: any) {
       return true
     }
     else {
-      errorMessage.value = `保存失败: ${res.data.error}`
+      errorMessage.value = `保存失败: ${getApiErrorMessage(res.data, '请求失败')}`
     }
   }
   catch (e: any) {
-    errorMessage.value = `保存失败: ${e.response?.data?.error || e.message}`
+    errorMessage.value = `保存失败: ${getApiErrorMessage(e, '请求失败')}`
   }
   finally {
     loading.value = false
@@ -67,10 +94,106 @@ async function addAccount(data: any) {
   return false
 }
 
+function clearQrNameSubmitTimer() {
+  if (qrNameSubmitTimer) {
+    clearTimeout(qrNameSubmitTimer)
+    qrNameSubmitTimer = undefined
+  }
+}
+
+async function addQrAccount(platform: 'wx' | 'qq', code: string, nickname: string) {
+  const name = form.name.trim() || nickname
+  if (platform === 'wx')
+    wxPendingCode = code
+  else
+    qqPendingCode = code
+
+  if (!name) {
+    if (platform === 'wx') {
+      wxStatus.value = '登录授权已完成，等待填写账号备注'
+      wxError.value = '未获取到微信昵称，请填写账号备注'
+    }
+    else {
+      qqStatus.value = '登录授权已完成，等待填写账号备注'
+      qqError.value = '未获取到 QQ 昵称，请填写账号备注'
+    }
+    return
+  }
+
+  form.name = name
+  await submitPendingQrAccount(platform)
+}
+
+async function submitPendingQrAccount(platform: 'wx' | 'qq') {
+  const name = form.name.trim() || props.editData?.name || ''
+  const code = platform === 'wx' ? wxPendingCode : qqPendingCode
+  if (!name || !code || !props.show || activeLoginTab.value !== `${platform}_qr`)
+    return
+
+  if (platform === 'wx') {
+    wxPendingCode = ''
+    wxError.value = ''
+    wxStatus.value = props.editData ? '正在重新登录...' : '正在添加账号...'
+  }
+  else {
+    qqPendingCode = ''
+    qqError.value = ''
+    qqStatus.value = props.editData ? '正在重新登录...' : '正在添加账号...'
+  }
+
+  const payload: any = { name, code, platform, loginType: 'manual' }
+  const saved = await addAccount(payload, !!props.editData)
+  if (!saved && props.show && activeLoginTab.value === `${platform}_qr`) {
+    if (platform === 'wx')
+      wxPendingCode = code
+    else
+      qqPendingCode = code
+  }
+}
+
+async function loadLoginSettings() {
+  const requestVersion = ++loginSettingsRequestVersion
+  loginSettingsLoaded.value = false
+  try {
+    const response = await api.get('/api/settings/login-config', { skipErrorToast: true } as any)
+    if (requestVersion !== loginSettingsRequestVersion)
+      return
+    const data = response.data?.data
+    loginSettings.value = {
+      wechatQrLogin: typeof data?.wechatQrLogin === 'boolean' ? data.wechatQrLogin : true,
+      qqQrLogin: typeof data?.qqQrLogin === 'boolean' ? data.qqQrLogin : false,
+      napCatEndpoint: typeof data?.napCatEndpoint === 'string' ? data.napCatEndpoint : '',
+      napCatSignature: typeof data?.napCatSignature === 'string' ? data.napCatSignature : '',
+    }
+  }
+  catch {
+    if (requestVersion !== loginSettingsRequestVersion)
+      return
+    // Keep the existing login entries available when an older server has no endpoint yet.
+    loginSettings.value = {
+      wechatQrLogin: true,
+      qqQrLogin: false,
+      napCatEndpoint: '',
+      napCatSignature: '',
+    }
+  }
+  finally {
+    if (requestVersion === loginSettingsRequestVersion) {
+      loginSettingsLoaded.value = true
+      if (activeLoginTab.value === 'wx_qr' && !loginSettings.value.wechatQrLogin)
+        activeLoginTab.value = 'code'
+      if (activeLoginTab.value === 'qq_qr' && !loginSettings.value.qqQrLogin)
+        activeLoginTab.value = 'code'
+      if (activeLoginTab.value === 'qq_qr' && loginSettings.value.qqQrLogin && !qqTaskId.value)
+        void startQqLogin()
+    }
+  }
+}
+
 // 手动提交
 async function submitManual() {
   errorMessage.value = ''
-  if (!form.name.trim()) {
+  if (!props.editData && !form.name.trim()) {
     errorMessage.value = '请输入账号备注'
     return
   }
@@ -87,35 +210,14 @@ async function submitManual() {
     form.code = code
   }
 
-  let payload: any = {}
-  if (props.editData) {
-    const onlyNameChanged = form.name !== props.editData.name
-      && form.code === (props.editData.code || '')
-      && form.platform === (props.editData.platform || 'qq')
-
-    if (onlyNameChanged) {
-      payload = { id: props.editData.id, name: form.name }
-    }
-    else {
-      payload = {
-        id: props.editData.id,
-        name: form.name,
-        code,
-        platform: form.platform,
-        loginType: 'manual',
-      }
-    }
-  }
-  else {
-    payload = {
-      name: form.name,
-      code,
-      platform: form.platform,
-      loginType: 'manual',
-    }
+  const payload: any = {
+    name: form.name,
+    code,
+    platform: props.editData ? (props.editData.platform || 'qq') : form.platform,
+    loginType: 'manual',
   }
 
-  await addAccount(payload)
+  await addAccount(payload, !!props.editData)
 }
 
 function stopWxPolling() {
@@ -143,6 +245,8 @@ function resetWxLogin() {
   wxError.value = ''
   wxQrUrl.value = ''
   wxLoading.value = false
+  wxPendingCode = ''
+  clearQrNameSubmitTimer()
 }
 
 function isWxFlowActive(taskId: string, flowVersion: number) {
@@ -152,19 +256,15 @@ function isWxFlowActive(taskId: string, flowVersion: number) {
 async function getWxCodeAndAdd(taskId: string, flowVersion: number) {
   if (!isWxFlowActive(taskId, flowVersion))
     return
-  if (!form.name.trim()) {
-    wxError.value = '请先填写账号备注'
-    return
-  }
   const codeResult = await api.post(`/api/wx-login/tasks/${taskId}/code`)
   if (!isWxFlowActive(taskId, flowVersion))
     return
   const code = String(codeResult.data?.data?.code || '').trim()
+  const nickname = String(codeResult.data?.data?.nickname || '').trim()
   if (!code)
     throw new Error('未获取到登录 Code')
 
-  // Deliberately use the same account API and payload as the manual form.
-  await addAccount({ name: form.name, code, platform: 'wx', loginType: 'manual' })
+  await addQrAccount('wx', code, nickname)
 }
 
 async function confirmWxLogin(taskId: string, flowVersion: number) {
@@ -199,11 +299,6 @@ async function pollWxLoginRequest(taskId: string, flowVersion: number) {
       wxStatus.value = '已扫码，请在手机上确认'
     }
     else if (status === 'authorized') {
-      if (!form.name.trim()) {
-        wxError.value = '请先填写账号备注'
-        wxPollTimer = setTimeout(() => void pollWxLogin(taskId, flowVersion), 1200)
-        return
-      }
       stopWxPolling()
       await confirmWxLogin(taskId, flowVersion)
       return
@@ -217,7 +312,7 @@ async function pollWxLoginRequest(taskId: string, flowVersion: number) {
   catch (error: any) {
     if (!isWxFlowActive(taskId, flowVersion) || error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED')
       return
-    wxError.value = error.response?.data?.error || error.message || '登录状态检查失败'
+    wxError.value = getApiErrorMessage(error, '登录状态检查失败')
   }
   finally {
     if (wxPollController === controller)
@@ -254,6 +349,10 @@ async function pollWxLogin(taskId: string, flowVersion: number) {
 }
 
 async function startWxLogin() {
+  if (!wechatQrLoginEnabled.value) {
+    activeLoginTab.value = 'code'
+    return
+  }
   resetWxLogin()
   const flowVersion = wxFlowVersion
   wxLoading.value = true
@@ -279,7 +378,7 @@ async function startWxLogin() {
   catch (error: any) {
     if (flowVersion !== wxFlowVersion)
       return
-    wxError.value = error.response?.data?.error || error.message || '二维码获取失败'
+    wxError.value = getApiErrorMessage(error, '二维码获取失败')
   }
   finally {
     if (flowVersion === wxFlowVersion)
@@ -287,8 +386,200 @@ async function startWxLogin() {
   }
 }
 
+function stopQqPolling() {
+  if (qqPollTimer) {
+    clearTimeout(qqPollTimer)
+    qqPollTimer = undefined
+  }
+  qqPollController?.abort()
+  qqPollController = undefined
+}
+
+function resetQqLogin() {
+  const taskId = qqTaskId.value
+  qqFlowVersion += 1
+  stopQqPolling()
+  if (taskId)
+    void cancelQqLoginTask(taskId)
+  qqTaskId.value = ''
+  qqStatus.value = ''
+  qqError.value = ''
+  qqQrUrl.value = ''
+  qqLoading.value = false
+  qqPendingCode = ''
+  clearQrNameSubmitTimer()
+}
+
+function isQqFlowActive(taskId: string, flowVersion: number) {
+  return flowVersion === qqFlowVersion && taskId === qqTaskId.value
+}
+
+function ensureQqApiOk(response: any, fallback: string) {
+  const payload = response?.data
+  if (payload?.ok === false)
+    throw new Error(getApiErrorMessage(payload, fallback))
+  return payload
+}
+
+async function getQqCodeAndAdd(taskId: string, flowVersion: number) {
+  if (!isQqFlowActive(taskId, flowVersion))
+    return
+  qqLoading.value = true
+  qqStatus.value = '正在获取小程序授权 Code...'
+  try {
+    const response = await api.post(`/api/qq-login/tasks/${taskId}/code`, undefined, { timeout: 120000 } as any)
+    if (!isQqFlowActive(taskId, flowVersion))
+      return
+    const payload = ensureQqApiOk(response, '获取小程序授权 Code 失败')
+    const code = String(payload?.data?.code || '').trim()
+    const nickname = String(payload?.data?.nickname || '').trim()
+    if (!code)
+      throw new Error('未获取到登录 Code')
+    await addQrAccount('qq', code, nickname)
+  }
+  catch (error: any) {
+    if (isQqFlowActive(taskId, flowVersion))
+      qqError.value = getApiErrorMessage(error, '获取小程序授权 Code 失败')
+  }
+  finally {
+    if (isQqFlowActive(taskId, flowVersion))
+      qqLoading.value = false
+  }
+}
+
+async function cancelQqLoginTask(taskId: string) {
+  if (!taskId)
+    return
+  try {
+    const response = await api.post(`/api/qq-login/tasks/${taskId}/cancel`, undefined, {
+      timeout: 120000,
+      skipErrorToast: true,
+    } as any)
+    ensureQqApiOk(response, 'QQ 登录任务取消失败')
+  }
+  catch {}
+}
+
+async function pollQqLoginRequest(taskId: string, flowVersion: number) {
+  if (!isQqFlowActive(taskId, flowVersion))
+    return
+
+  const controller = new AbortController()
+  qqPollController = controller
+  try {
+    const response = await api.post(`/api/qq-login/tasks/${taskId}/status`, undefined, {
+      timeout: 120000,
+      signal: controller.signal,
+      skipErrorToast: true,
+    } as any)
+    if (!isQqFlowActive(taskId, flowVersion))
+      return
+
+    const payload = ensureQqApiOk(response, 'QQ 登录状态检查失败')
+    const task = payload?.data
+    if (!task)
+      throw new Error('QQ 登录状态返回无效')
+    const status = String(task?.status || '').trim()
+    const qrImage = String(task?.qr_image || '').trim()
+    if (qrImage)
+      qqQrUrl.value = qrImage
+
+    if (status === 'waiting_scan') {
+      qqStatus.value = '等待 QQ 扫码'
+    }
+    else if (status === 'scanned') {
+      qqStatus.value = '已扫码，请在手机上确认'
+    }
+    else if (status === 'confirmed') {
+      stopQqPolling()
+      await getQqCodeAndAdd(taskId, flowVersion)
+      return
+    }
+    else if (['cancelled', 'expired', 'failed'].includes(status)) {
+      qqError.value = '二维码已失效，请重新获取'
+      return
+    }
+    if (!status) {
+      qqError.value = 'QQ 登录状态异常，请重新获取二维码'
+      return
+    }
+    qqPollTimer = setTimeout(() => void pollQqLogin(taskId, flowVersion), 1200)
+  }
+  catch (error: any) {
+    if (!isQqFlowActive(taskId, flowVersion) || error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED')
+      return
+    qqError.value = getApiErrorMessage(error, 'QQ 登录状态检查失败')
+  }
+  finally {
+    if (qqPollController === controller)
+      qqPollController = undefined
+  }
+}
+
+async function pollQqLogin(taskId: string, flowVersion: number) {
+  if (!isQqFlowActive(taskId, flowVersion))
+    return
+
+  const previous = qqPollInFlight
+  const previousKey = qqPollKey
+  if (previous) {
+    await previous.catch(() => undefined)
+    if (!isQqFlowActive(taskId, flowVersion))
+      return
+    if (previousKey === `${taskId}:${flowVersion}`)
+      return
+  }
+
+  const current = pollQqLoginRequest(taskId, flowVersion)
+  qqPollInFlight = current
+  qqPollKey = `${taskId}:${flowVersion}`
+  try {
+    await current
+  }
+  finally {
+    if (qqPollInFlight === current) {
+      qqPollInFlight = undefined
+      qqPollKey = ''
+    }
+  }
+}
+
+async function startQqLogin() {
+  if (!qqQrLoginEnabled.value) {
+    activeLoginTab.value = 'code'
+    return
+  }
+  resetQqLogin()
+  const flowVersion = qqFlowVersion
+  qqLoading.value = true
+  try {
+    const response = await api.post('/api/qq-login/tasks')
+    const payload = ensureQqApiOk(response, 'QQ 登录二维码获取失败')
+    const task = payload?.data
+    const taskId = String(task?.task_id || '')
+    const qrImage = String(task?.qr_image || '')
+    if (!taskId || !qrImage)
+      throw new Error('未创建 QQ 登录任务')
+    if (flowVersion !== qqFlowVersion)
+      return
+    qqTaskId.value = taskId
+    qqQrUrl.value = qrImage
+    qqStatus.value = '等待 QQ 扫码'
+    void pollQqLogin(taskId, flowVersion)
+  }
+  catch (error: any) {
+    if (flowVersion === qqFlowVersion)
+      qqError.value = getApiErrorMessage(error, 'QQ 登录二维码获取失败')
+  }
+  finally {
+    if (flowVersion === qqFlowVersion)
+      qqLoading.value = false
+  }
+}
+
 function close() {
   resetWxLogin()
+  resetQqLogin()
   emit('close')
 }
 
@@ -297,6 +588,7 @@ watch(() => props.show, (newVal) => {
     errorMessage.value = ''
     activeLoginTab.value = 'code'
     resetWxLogin()
+    void loadLoginSettings()
     if (props.editData) {
       form.name = props.editData.name || ''
       form.code = props.editData.code || ''
@@ -311,27 +603,50 @@ watch(() => props.show, (newVal) => {
 })
 
 watch(activeLoginTab, (tab) => {
-  if (tab === 'wx_qr' && !wxTaskId.value)
+  if (tab === 'wx_qr' && wechatQrLoginEnabled.value && !wxTaskId.value)
     void startWxLogin()
-  else if (tab !== 'wx_qr')
+  else if (tab === 'wx_qr' && !wechatQrLoginEnabled.value)
+    activeLoginTab.value = 'code'
+  else if (tab === 'qq_qr' && qqQrLoginEnabled.value && !qqTaskId.value)
+    void startQqLogin()
+  else if (tab === 'qq_qr' && !qqQrLoginEnabled.value)
+    activeLoginTab.value = 'code'
+  if (tab !== 'wx_qr')
     resetWxLogin()
+  if (tab !== 'qq_qr')
+    resetQqLogin()
 })
 
-onBeforeUnmount(resetWxLogin)
+watch(() => form.name, (name) => {
+  clearQrNameSubmitTimer()
+  if (!name.trim())
+    return
+  const platform = activeLoginTab.value === 'wx_qr'
+    ? 'wx'
+    : activeLoginTab.value === 'qq_qr' ? 'qq' : undefined
+  if (!platform || !(platform === 'wx' ? wxPendingCode : qqPendingCode))
+    return
+  qrNameSubmitTimer = setTimeout(() => void submitPendingQrAccount(platform), 800)
+})
+
+onBeforeUnmount(() => {
+  resetWxLogin()
+  resetQqLogin()
+})
 </script>
 
 <template>
   <NModal
     :show="show"
-    :mask-closable="!loading && !wxLoading"
-    :close-on-esc="!loading && !wxLoading"
+    :mask-closable="!loading && !wxLoading && !qqLoading"
+    :close-on-esc="!loading && !wxLoading && !qqLoading"
     @update:show="value => !value && close()"
   >
     <NCard
       class="account-modal-card"
       :title="editData ? '编辑账号' : '添加账号'"
       :bordered="false"
-      :closable="!loading && !wxLoading"
+      :closable="!loading && !wxLoading && !qqLoading"
       @close="close"
     >
       <div class="account-modal-content overflow-y-auto">
@@ -340,17 +655,21 @@ onBeforeUnmount(resetWxLogin)
           {{ errorMessage }}
         </div>
 
-        <NTabs v-if="!editData" v-model:value="activeLoginTab" class="mb-4" type="line">
+        <NTabs v-if="loginSettingsLoaded" v-model:value="activeLoginTab" class="mb-4" type="line">
           <NTab name="code">
             输入 Code 登录
           </NTab>
-          <NTab name="wx_qr">
+          <NTab v-if="wechatQrLoginEnabled" name="wx_qr">
             微信扫码登录
+          </NTab>
+          <NTab v-if="qqQrLoginEnabled" name="qq_qr">
+            QQ扫码登录
           </NTab>
         </NTabs>
 
-        <div v-if="editData || activeLoginTab === 'code'" class="space-y-4">
+        <div v-if="activeLoginTab === 'code'" class="space-y-4">
           <BaseInput
+            v-if="!editData"
             v-model="form.name"
             label="账号备注（必填）"
             placeholder="请输入账号备注"
@@ -385,11 +704,11 @@ onBeforeUnmount(resetWxLogin)
             </BaseButton>
           </div>
         </div>
-        <div v-else class="space-y-4" role="tabpanel" aria-label="微信扫码登录">
+        <div v-else-if="activeLoginTab === 'wx_qr'" class="space-y-4" role="tabpanel" aria-label="微信扫码登录">
           <BaseInput
             v-model="form.name"
-            label="账号备注（必填）"
-            placeholder="请输入账号备注"
+            label="账号备注（可留空）"
+            placeholder="留空时使用微信昵称"
             class="farm-input"
           />
           <div class="min-h-64 flex flex-col items-center justify-center gap-3">
@@ -408,6 +727,36 @@ onBeforeUnmount(resetWxLogin)
           </div>
           <div class="flex justify-end gap-2">
             <BaseButton variant="outline" @click="startWxLogin">
+              刷新二维码
+            </BaseButton>
+            <BaseButton variant="outline" @click="close">
+              取消
+            </BaseButton>
+          </div>
+        </div>
+        <div v-else-if="activeLoginTab === 'qq_qr'" class="space-y-4" role="tabpanel" aria-label="QQ扫码登录">
+          <BaseInput
+            v-model="form.name"
+            label="账号备注（可留空）"
+            placeholder="留空时使用 QQ 昵称"
+            class="farm-input"
+          />
+          <div class="min-h-64 flex flex-col items-center justify-center gap-3">
+            <div v-if="qqQrUrl" class="bg-white p-2">
+              <img :src="qqQrUrl" alt="QQ登录二维码" class="h-52 w-52">
+            </div>
+            <div v-else class="h-52 w-52 flex items-center justify-center text-sm opacity-60">
+              {{ qqLoading ? '正在获取二维码...' : '二维码不可用' }}
+            </div>
+            <p class="text-sm" :style="{ color: 'var(--theme-text)' }">
+              {{ qqStatus }}
+            </p>
+            <p v-if="qqError" class="text-sm text-red-500">
+              {{ qqError }}
+            </p>
+          </div>
+          <div class="flex justify-end gap-2">
+            <BaseButton variant="outline" :loading="qqLoading" @click="startQqLogin">
               刷新二维码
             </BaseButton>
             <BaseButton variant="outline" @click="close">

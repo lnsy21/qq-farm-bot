@@ -1,6 +1,6 @@
 export {};
 
-type ActivityDetailTarget = 'travel' | 'constellation' | 'shop' | 'solar' | 'qixi' | 'qingmei' | 'weather';
+type ActivityDetailTarget = 'travel' | 'constellation' | 'shop' | 'solar' | 'qixi' | 'qingmei' | 'charity' | 'weather' | 'pet' | 'wish' | 'happy';
 
 interface ActivityGameplayContext {
     season?: any;
@@ -9,6 +9,7 @@ interface ActivityGameplayContext {
     constellation?: any;
     qixi?: any;
     qingMei?: any;
+    charity?: any;
     weather?: any;
 }
 
@@ -26,6 +27,14 @@ interface ActivityGameplayBinding {
 }
 
 const GAMEPLAY_ADAPTERS: readonly ActivityGameplayAdapter[] = [
+    { gameplayKey: 'wish', detailTarget: 'wish', priority: 1, activityIds: () => ['2026092400', '2026092401'] },
+    { gameplayKey: 'happy', detailTarget: 'happy', priority: 2, activityIds: () => ['2026092500', '2026092501'] },
+    {
+        gameplayKey: 'pet',
+        detailTarget: 'pet',
+        priority: 5,
+        activityIds: () => ['2026090100', '2026090101', '2026090102', '2026090103'],
+    },
     {
         gameplayKey: 'stellar',
         detailTarget: 'travel',
@@ -85,16 +94,32 @@ const GAMEPLAY_ADAPTERS: readonly ActivityGameplayAdapter[] = [
         ],
     },
     {
+        gameplayKey: 'charity',
+        detailTarget: 'charity',
+        priority: 70,
+        activityIds: context => [
+            '2026090900',
+            '2026090901',
+            context.charity?.groupId,
+            context.charity?.activityId,
+        ],
+    },
+    {
         gameplayKey: 'weather',
         detailTarget: 'weather',
-        priority: 70,
+        priority: 80,
         activityIds: context => [
             '2026070300',
             '2026070301',
+            '2026070302',
             '2026070303',
             '2026070304',
             '2026070305',
             context.weather?.groupId,
+            context.weather?.shop?.activityId,
+            context.weather?.mutation?.activityId,
+            context.weather?.collector?.activityId,
+            context.weather?.research?.activityId,
             context.weather?.catalogActivityId,
             context.weather?.taskActivityId,
             context.weather?.researchActivityId,

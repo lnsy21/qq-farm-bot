@@ -28,7 +28,7 @@ let freeGiftLastCheckAt: number = 0;
 async function getMallListBySlotType(slotType: number = 1, subSlotType: number = 0): Promise<any> {
     const body: Uint8Array = types.GetMallListBySlotTypeRequest.encode(types.GetMallListBySlotTypeRequest.create({
         slot_type: Number(slotType) || 1,
-        sub_slot_type: Number(subSlotType) || 0,
+        is_manual_open: Number(subSlotType) === 1,
     })).finish();
     const { body: replyBody } = await sendMsgAsync('gamepb.mallpb.MallService', 'GetMallListBySlotType', body);
     return types.GetMallListBySlotTypeResponse.decode(replyBody);
@@ -40,7 +40,9 @@ async function purchaseMallGoods(goodsId: number, count: number = 1): Promise<an
         count: Number(count) || 1,
     })).finish();
     const { body: replyBody } = await sendMsgAsync('gamepb.mallpb.MallService', 'Purchase', body);
-    return types.PurchaseResponse.decode(replyBody);
+    const reply = types.PurchaseResponse.decode(replyBody);
+    if (reply.success !== true) throw new Error('商城未确认购买成功，请刷新核对');
+    return reply;
 }
 
 async function getMallGoodsList(slotType: number = 1): Promise<any[]> {
@@ -162,7 +164,7 @@ async function autoBuyOrganicFertilizerViaMall(): Promise<number> {
     return totalBought;
 }
 
-async function autoBuyFertilizerViaMall(type: string = 'organic', targetCount: number = 0): Promise<number> {
+async function autoBuyFertilizerViaMall(type: string = 'organic', targetCount: number = 0, propagateErrors: boolean = false): Promise<number> {
     log('商城', `开始购买化肥, 类型: ${type === 'normal' ? '无机化肥' : '有机化肥'}, 数量: ${targetCount || '不限'}`, {
         module: 'warehouse',
         event: '购买化肥',
@@ -235,6 +237,7 @@ async function autoBuyFertilizerViaMall(type: string = 'organic', targetCount: n
                 }
                 buyPausedNoGoldDateKey = getSystemDateKey();
             }
+            if (propagateErrors) throw e;
             break;
         }
     }
@@ -275,13 +278,13 @@ async function autoBuyOrganicFertilizer(force: boolean = false): Promise<number>
     }
 }
 
-async function autoBuyFertilizer(force: boolean = false, type: string = 'organic', targetCount: number = 0): Promise<number> {
+async function autoBuyFertilizer(force: boolean = false, type: string = 'organic', targetCount: number = 0, propagateErrors: boolean = false): Promise<number> {
     const now: number = Date.now();
     if (!force && now - lastBuyAt < BUY_COOLDOWN_MS) return 0;
     lastBuyAt = now;
 
     try {
-        const totalBought: number = await autoBuyFertilizerViaMall(type, targetCount);
+        const totalBought: number = await autoBuyFertilizerViaMall(type, targetCount, propagateErrors);
         if (totalBought > 0) {
             buyDoneDateKey = getSystemDateKey();
             buyLastSuccessAt = Date.now();
@@ -295,7 +298,8 @@ async function autoBuyFertilizer(force: boolean = false, type: string = 'organic
             });
         }
         return totalBought;
-    } catch {
+    } catch (error) {
+        if (propagateErrors) throw error;
         return 0;
     }
 }
@@ -312,7 +316,7 @@ async function buyFreeGifts(force: boolean = false): Promise<number> {
 
     try {
         const goods: any[] = await getMallGoodsList(1);
-        const free: any[] = goods.filter((g: any) => !!g && g.is_free === true && Number(g.goods_id || 0) > 0);
+        const free: any[] = goods.filter((g: any) => !!g && g.is_free === true && g.is_available === true && !g.ad_only && !g.share?.share_only && toNum(g.price?.count) === 0 && Number(g.goods_id || 0) > 0);
         if (!free.length) {
             freeGiftDoneDateKey = getSystemDateKey();
             log('商城', '今日暂无可领取免费礼包', {
@@ -359,7 +363,7 @@ async function buyFreeGifts(force: boolean = false): Promise<number> {
     }
 }
 
-async function checkAndBuyFertilizerByThreshold(type: string, count: number, thresholdHours: number): Promise<any> {
+async function checkAndBuyFertilizerByThreshold(type: string, count: number, thresholdHours: number, propagateErrors: boolean = false): Promise<any> {
     const { getBag, getBagItems, getContainerHoursFromBagItems } = require('./warehouse');
 
     if (count <= 0 || thresholdHours <= 0) {
@@ -383,7 +387,7 @@ async function checkAndBuyFertilizerByThreshold(type: string, count: number, thr
         });
 
         if (currentHours < thresholdHours) {
-            const bought: number = await autoBuyFertilizer(true, type, count);
+            const bought: number = await autoBuyFertilizer(true, type, count, propagateErrors);
             return { bought, currentHours, thresholdHours, needed: true };
         }
 
@@ -395,11 +399,12 @@ async function checkAndBuyFertilizerByThreshold(type: string, count: number, thr
             result: 'error',
             error: e.message,
         });
+        if (propagateErrors) throw e;
         return { bought: 0, error: e.message };
     }
 }
 
-async function checkAndBuyFertilizerBoth(options: any): Promise<any> {
+async function checkAndBuyFertilizerBoth(options: any, propagateErrors: boolean = false): Promise<any> {
     const { getBag, getBagItems, getContainerHoursFromBagItems } = require('./warehouse');
     const { sleep, randomDelay } = require('../utils/utils');
 
@@ -441,7 +446,7 @@ async function checkAndBuyFertilizerBoth(options: any): Promise<any> {
             });
 
             if (containerHours.organic < organicThresholdHours) {
-                result.organicBought = await autoBuyFertilizer(true, 'organic', organicCount);
+                result.organicBought = await autoBuyFertilizer(true, 'organic', organicCount, propagateErrors);
             }
         }
 
@@ -461,7 +466,7 @@ async function checkAndBuyFertilizerBoth(options: any): Promise<any> {
             });
 
             if (containerHours.normal < normalThresholdHours) {
-                result.normalBought = await autoBuyFertilizer(true, 'normal', normalCount);
+                result.normalBought = await autoBuyFertilizer(true, 'normal', normalCount, propagateErrors);
             }
         }
 
@@ -473,6 +478,7 @@ async function checkAndBuyFertilizerBoth(options: any): Promise<any> {
             result: 'error',
             error: e.message,
         });
+        if (propagateErrors) throw e;
         return { ...result, error: e.message };
     }
 }

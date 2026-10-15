@@ -2,10 +2,12 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import api from '@/api'
 
-export type ActivityTabKey = 'travel' | 'constellation' | 'shop' | 'solar' | 'qixi' | 'qingmei' | 'weather'
-export type ActivityGameplayKey = 'stellar' | 'qixi' | 'qingmei' | 'weather'
+export type ActivityTabKey = 'travel' | 'constellation' | 'shop' | 'solar' | 'qixi' | 'qingmei' | 'charity' | 'weather' | 'pet' | 'wish' | 'happy'
+export type ActivityGameplayKey = 'stellar' | 'qixi' | 'qingmei' | 'charity' | 'weather' | 'pet' | 'wish' | 'happy'
 export type ActivityVariant = 'blue' | 'violet' | 'gold' | 'green'
 export type ActivityRecord = Record<string, unknown>
+
+export const WEATHER_SCAN_BATCH_SIZE = 5
 
 export interface ActivityDirectoryItemDto {
   id: string
@@ -221,6 +223,9 @@ export interface ActivityActionsDto {
   qixiBridge: ActivityActionDto
   qixiGift: ActivityActionDto
   qixiDew: ActivityActionDto
+  charityClaimSeeds: ActivityActionDto
+  charityDonateLove: ActivityActionDto
+  charityClaimDailyGift: ActivityActionDto
   weatherResearch?: ActivityActionDto
 }
 
@@ -238,6 +243,46 @@ export interface WeatherResearchNodeDto {
   reward: ActivityItemDto
 }
 
+export interface WeatherStatusDto {
+  hostGid: string
+  type: number
+  status: number
+  beginTime: number | null
+  endTime: number | null
+  source: number
+  field8: number
+  friendMarker: number
+  collectedThisCycle: boolean
+  active: boolean
+  isThunderstorm: boolean
+  remainingSec: number
+  durationSec: number
+}
+
+export interface WeatherFriendDto {
+  gid: string
+  name: string
+  avatarUrl: string
+  level: number
+  inspected: boolean
+  inspectedAt: number | null
+  scanError: string
+  availability: 'unknown' | 'available' | 'collected' | 'expired' | 'unavailable'
+  availabilityReason: string
+  canCollect: boolean
+  eligibleCloudLandIds: string[]
+  weather: WeatherStatusDto
+}
+
+export interface WeatherCommandDto {
+  enabled: boolean
+  reason: string
+  batchSize: number
+  friendCount: number
+  nodeId: string
+  dailyLimit: number
+}
+
 export interface WeatherActivityDto {
   groupId: string
   activityId: string
@@ -248,6 +293,8 @@ export interface WeatherActivityDto {
   title: string
   startTime: number | null
   endTime: number | null
+  serverTime: number | null
+  active: boolean
   rules: ActivityRulesDto
   badge: ActivityItemDto
   balances: { badge: string | null, collectionBottle: string | null, rainBottle: string | null, known: boolean }
@@ -261,13 +308,15 @@ export interface WeatherActivityDto {
     darkCloudBottle: ActivityItemDto
     lightningSense: ActivityItemDto & { effectPerItemPercent?: number, effectPercent?: number, passive?: boolean, active?: boolean }
   }
-  // id identifies the weather kind; type is the separate raw protocol field.
-  weather: { id: string, type: string, typeName: string | null, beginTime: number | null, endTime: number | null, active: boolean } | null
+  // The upstream layout calls these id/type. For the capture-verified local DTO,
+  // id is WeatherStatus.weather_type (field 1) and type is status (field 2).
+  weather: { id: string, type: string, typeName: string | null, statusName: string, beginTime: number | null, endTime: number | null, active: boolean } | null
+  friends: WeatherFriendDto[]
   catalog: Array<{ id: string, item: ActivityItemDto, cost: ActivityItemDto, status: string, name: string }>
   progress: { taskId: string, current: string, target: string, item: ActivityItemDto, reward: ActivityItemDto, rewardStatus: string, status: string, active: boolean }
   tasks: Array<{ id: string, itemId: string, name: string, target: string, reward: ActivityItemDto, current: string, active: boolean }>
   research: WeatherResearchNodeDto[]
-  actions: { research: ActivityActionDto }
+  actions: { research: ActivityActionDto, scanFriendWeather: WeatherCommandDto }
 }
 
 export interface QixiBridgeStageDto {
@@ -393,6 +442,55 @@ export interface QingMeiActivityDto {
   }
 }
 
+export interface CharityProgressRewardDto {
+  target: string
+  reward: ActivityItemDto
+  statusCode: string
+  reached: boolean
+  claimed: boolean
+  claimable: boolean
+  claimSupported: boolean
+}
+
+export interface CharityRedFlowerActivityDto {
+  groupId: string
+  activityId: string
+  name: string
+  title: string
+  startTime: number | null
+  endTime: number | null
+  serverTime: number | null
+  active: boolean
+  rules: ActivityRulesDto
+  love: ActivityItemDto
+  loveBalance: string
+  donatedLove: string
+  flowStatus: string
+  agreementStatus: string
+  seedReward: { statusCode: string, claimable: boolean, claimed: boolean, reward: ActivityItemDto }
+  dailyGift: {
+    statusCode: string
+    claimed: boolean
+    harvestedToday: boolean
+    reward: ActivityItemDto
+    publicFund: { date: string, statusCode: string } | null
+  }
+  progressRewards: CharityProgressRewardDto[]
+  globalProgress: { donated: string, target: string, reached: boolean, rewardTarget: string, reward: ActivityItemDto }
+  settlement: {
+    requiredLove: string
+    eligible: boolean
+    globalReached: boolean
+    personalReached: boolean
+    reward: ActivityItemDto
+  }
+  actions: {
+    claimSeeds: ActivityActionDto
+    donateLove: ActivityActionDto
+    claimDailyGift: ActivityActionDto
+  }
+}
+
 export interface ActivityCenterSnapshotDto {
   serverTime: number | null
   activities: ActivityDirectoryItemDto[]
@@ -402,11 +500,12 @@ export interface ActivityCenterSnapshotDto {
   constellation: ConstellationDto | null
   qixi: QixiActivityDto | null
   qingMei: QingMeiActivityDto | null
+  charity: CharityRedFlowerActivityDto | null
   weather: WeatherActivityDto | null
   actions: ActivityActionsDto
 }
 
-export type ActivityMutationKey = 'claimPass' | 'lightConstellation' | 'claimSolar' | 'exchange' | 'claimQixiBridge' | 'giftQixiSachet' | 'claimQingMeiSeed' | 'startQingMeiBrew' | 'continueQingMeiBrew' | 'settleQingMeiBrew' | 'lightWeatherResearch' | 'buyWeatherBottle' | 'collectWeatherBottle' | 'summonWeatherRain'
+export type ActivityMutationKey = 'claimPass' | 'lightConstellation' | 'claimSolar' | 'exchange' | 'claimQixiBridge' | 'giftQixiSachet' | 'claimQingMeiSeed' | 'startQingMeiBrew' | 'continueQingMeiBrew' | 'settleQingMeiBrew' | 'claimCharitySeeds' | 'donateCharityLove' | 'claimCharityDailyGift' | 'claimCharityProgress' | 'lightWeatherResearch' | 'buyWeatherBottle' | 'scanWeatherFriends' | 'collectWeatherBottle' | 'summonWeatherRain'
 
 function isRecord(value: unknown): value is ActivityRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -795,13 +894,13 @@ function normalizeSolarTerms(value: unknown): SolarTermsDto | null {
 function normalizeActivityDirectory(value: unknown): ActivityDirectoryItemDto[] {
   return records(value).map((entry) => {
     const detailTarget = text(entry.detailTarget, entry.detail_target)
-    const normalizedDetailTarget = ['travel', 'constellation', 'shop', 'solar', 'qixi', 'qingmei', 'weather'].includes(detailTarget)
+    const normalizedDetailTarget = ['travel', 'constellation', 'shop', 'solar', 'qixi', 'qingmei', 'charity', 'weather', 'pet', 'wish', 'happy'].includes(detailTarget)
       ? detailTarget as ActivityTabKey
       : null
     const gameplayKey = text(entry.gameplayKey, entry.gameplay_key)
     const rawGameplayTargets = first(entry.gameplayTargets, entry.gameplay_targets)
     const gameplayTargets = Array.isArray(rawGameplayTargets)
-      ? rawGameplayTargets.map(value => text(value)).filter((value): value is ActivityTabKey => ['travel', 'constellation', 'shop', 'solar', 'qixi', 'qingmei', 'weather'].includes(value))
+      ? rawGameplayTargets.map(value => text(value)).filter((value): value is ActivityTabKey => ['travel', 'constellation', 'shop', 'solar', 'qixi', 'qingmei', 'charity', 'weather', 'pet', 'wish', 'happy'].includes(value))
       : []
     const id = text(entry.id, entry.activityId, entry.activity_id)
     const rawActivityIds = first(entry.activityIds, entry.activity_ids)
@@ -814,15 +913,21 @@ function normalizeActivityDirectory(value: unknown): ActivityDirectoryItemDto[] 
       name: text(entry.name, entry.title),
       startTime: toMilliseconds(first(entry.startTime, entry.start_time, entry.beginTime, entry.begin_time)),
       endTime: toMilliseconds(first(entry.endTime, entry.end_time)),
-      gameplayKey: gameplayKey === 'weather' || normalizedDetailTarget === 'weather'
+      gameplayKey: gameplayKey === 'wish' || normalizedDetailTarget === 'wish' ? 'wish' as const
+        : gameplayKey === 'happy' || normalizedDetailTarget === 'happy' ? 'happy' as const
+        : gameplayKey === 'pet' || normalizedDetailTarget === 'pet'
+        ? 'pet' as const
+        : gameplayKey === 'weather' || normalizedDetailTarget === 'weather'
         ? 'weather' as const
-        : gameplayKey === 'qingmei' || normalizedDetailTarget === 'qingmei'
-          ? 'qingmei' as const
-          : gameplayKey === 'qixi' || normalizedDetailTarget === 'qixi'
-            ? 'qixi' as const
-            : gameplayKey === 'stellar' || normalizedDetailTarget
-              ? 'stellar' as const
-              : null,
+        : gameplayKey === 'charity' || normalizedDetailTarget === 'charity'
+          ? 'charity' as const
+          : gameplayKey === 'qingmei' || normalizedDetailTarget === 'qingmei'
+            ? 'qingmei' as const
+            : gameplayKey === 'qixi' || normalizedDetailTarget === 'qixi'
+              ? 'qixi' as const
+              : gameplayKey === 'stellar' || normalizedDetailTarget
+                ? 'stellar' as const
+                : null,
       gameplayTargets: gameplayTargets.length > 0 ? gameplayTargets : normalizedDetailTarget ? [normalizedDetailTarget] : [],
       detailTarget: normalizedDetailTarget,
     }
@@ -986,10 +1091,291 @@ function normalizeQingMei(value: unknown): QingMeiActivityDto | null {
   }
 }
 
+function normalizeWeatherStatus(value: unknown): WeatherStatusDto {
+  const raw = record(value)
+  const beginTime = toMilliseconds(first(raw.beginTime, raw.begin_time))
+  const endTime = toMilliseconds(first(raw.endTime, raw.end_time))
+  return {
+    hostGid: text(raw.hostGid, raw.host_gid),
+    type: finiteNumber(first(raw.type, raw.weatherType, raw.weather_type)) || 0,
+    status: finiteNumber(raw.status) || 0,
+    beginTime,
+    endTime,
+    source: finiteNumber(raw.source) || 0,
+    field8: finiteNumber(first(raw.field8, raw.field_8)) || 0,
+    friendMarker: finiteNumber(first(raw.friendMarker, raw.friend_marker, raw.field9, raw.field_9)) || 0,
+    collectedThisCycle: bool(
+      raw.collectedThisCycle,
+      raw.collected_this_cycle,
+      raw.collectedToday,
+      raw.collected_today,
+    ),
+    active: bool(raw.active),
+    isThunderstorm: bool(raw.isThunderstorm, raw.is_thunderstorm),
+    remainingSec: Math.max(0, finiteNumber(first(raw.remainingSec, raw.remaining_sec)) || 0),
+    durationSec: beginTime !== null && endTime !== null ? Math.max(0, Math.round((endTime - beginTime) / 1000)) : 0,
+  }
+}
+
+function normalizeCharityRedFlower(value: unknown): CharityRedFlowerActivityDto | null {
+  if (!isRecord(value))
+    return null
+  const raw = value
+  const seedReward = record(first(raw.seedReward, raw.seed_reward))
+  const dailyGift = record(first(raw.dailyGift, raw.daily_gift))
+  const publicFund = record(first(dailyGift.publicFund, dailyGift.public_fund))
+  const globalProgress = record(first(raw.globalProgress, raw.global_progress))
+  const settlement = record(raw.settlement)
+  const actions = record(raw.actions)
+  return {
+    groupId: text(raw.groupId, raw.group_id),
+    activityId: text(raw.activityId, raw.activity_id),
+    name: text(raw.name, '公益小红花'),
+    title: text(raw.title, raw.name, '公益小红花'),
+    startTime: toMilliseconds(first(raw.startTime, raw.start_time)),
+    endTime: toMilliseconds(first(raw.endTime, raw.end_time)),
+    serverTime: toMilliseconds(first(raw.serverTime, raw.server_time)),
+    active: bool(raw.active),
+    rules: normalizeRules(raw.rules),
+    love: normalizeItem(raw.love),
+    loveBalance: text(raw.loveBalance, raw.love_balance),
+    donatedLove: text(raw.donatedLove, raw.donated_love),
+    flowStatus: text(raw.flowStatus, raw.flow_status),
+    agreementStatus: text(raw.agreementStatus, raw.agreement_status),
+    seedReward: {
+      statusCode: text(seedReward.statusCode, seedReward.status_code),
+      claimable: bool(seedReward.claimable),
+      claimed: bool(seedReward.claimed),
+      reward: normalizeItem(seedReward.reward),
+    },
+    dailyGift: {
+      statusCode: text(dailyGift.statusCode, dailyGift.status_code),
+      claimed: bool(dailyGift.claimed),
+      harvestedToday: bool(dailyGift.harvestedToday, dailyGift.harvested_today),
+      reward: normalizeItem(dailyGift.reward),
+      publicFund: Object.keys(publicFund).length > 0
+        ? { date: text(publicFund.date), statusCode: text(publicFund.statusCode, publicFund.status_code) }
+        : null,
+    },
+    progressRewards: records(first(raw.progressRewards, raw.progress_rewards)).map(entry => ({
+      target: text(entry.target),
+      reward: normalizeItem(entry.reward),
+      statusCode: text(entry.statusCode, entry.status_code, entry.status),
+      reached: bool(entry.reached),
+      claimed: bool(entry.claimed),
+      claimable: bool(entry.claimable, entry.canClaim, entry.available),
+      claimSupported: bool(entry.claimSupported, entry.claim_supported),
+    })),
+    globalProgress: {
+      donated: text(globalProgress.donated),
+      target: text(globalProgress.target),
+      reached: bool(globalProgress.reached),
+      rewardTarget: text(globalProgress.rewardTarget, globalProgress.reward_target),
+      reward: normalizeItem(globalProgress.reward),
+    },
+    settlement: {
+      requiredLove: text(settlement.requiredLove, settlement.required_love),
+      eligible: bool(settlement.eligible),
+      globalReached: bool(settlement.globalReached, settlement.global_reached),
+      personalReached: bool(settlement.personalReached, settlement.personal_reached),
+      reward: normalizeItem(settlement.reward),
+    },
+    actions: {
+      claimSeeds: normalizeAction(actions, {}, ['claimSeeds', 'claim_seeds']),
+      donateLove: normalizeAction(actions, {}, ['donateLove', 'donate_love']),
+      claimDailyGift: normalizeAction(actions, {}, ['claimDailyGift', 'claim_daily_gift']),
+    },
+  }
+}
+
+function normalizeWeatherFriend(value: unknown): WeatherFriendDto {
+  const raw = record(value)
+  const availabilityValue = text(raw.availability).toLowerCase()
+  const availability: WeatherFriendDto['availability'] = ['unknown', 'available', 'collected', 'expired', 'unavailable'].includes(availabilityValue)
+    ? availabilityValue as WeatherFriendDto['availability']
+    : 'unknown'
+  const cloudLandIds = first(raw.eligibleCloudLandIds, raw.eligible_cloud_land_ids)
+  return {
+    gid: text(raw.gid),
+    name: text(raw.name, raw.remark),
+    avatarUrl: text(raw.avatarUrl, raw.avatar_url),
+    level: finiteNumber(raw.level) || 0,
+    inspected: bool(raw.inspected),
+    inspectedAt: toMilliseconds(first(raw.inspectedAt, raw.inspected_at)),
+    scanError: text(raw.scanError, raw.scan_error),
+    availability,
+    availabilityReason: text(raw.availabilityReason, raw.availability_reason),
+    canCollect: bool(raw.canCollect, raw.can_collect),
+    eligibleCloudLandIds: Array.isArray(cloudLandIds) ? cloudLandIds.map(entry => text(entry)).filter(Boolean) : [],
+    weather: normalizeWeatherStatus(raw.weather),
+  }
+}
+
+function normalizeWeatherCommand(value: unknown): WeatherCommandDto {
+  const raw = record(value)
+  return {
+    enabled: typeof value === 'boolean' ? value : bool(raw.enabled, raw.available),
+    reason: text(raw.reason),
+    batchSize: Math.max(1, finiteNumber(first(raw.batchSize, raw.batch_size)) || WEATHER_SCAN_BATCH_SIZE),
+    friendCount: finiteNumber(first(raw.friendCount, raw.friend_count)) || 0,
+    nodeId: text(raw.nodeId, raw.node_id),
+    dailyLimit: finiteNumber(first(raw.dailyLimit, raw.daily_limit)) || 0,
+  }
+}
+
+function weatherStatusName(status: string, active: boolean) {
+  if (!active || !status || status === '0')
+    return '未生效'
+  if (status === '2')
+    return '生效中'
+  return `未知状态（${status}）`
+}
+
 function normalizeWeather(value: unknown): WeatherActivityDto | null {
   if (!isRecord(value))
     return null
   const raw = value
+  const localInventory = records(raw.inventory)
+  const localActivity = record(raw.activity)
+  const localOwnWeather = record(first(raw.ownWeather, raw.own_weather))
+  // The capture-verified service exposes a richer DTO than the upstream view.
+  // Adapt it here so the upstream layout can be retained without changing the
+  // verified field-107 collection and field-140 research operations.
+  if (Array.isArray(raw.inventory) || Object.keys(localOwnWeather).length > 0) {
+    const itemNames: Record<string, string> = {
+      1027: '雷电徽章',
+      4002: '闪电感应',
+      4003: '闪电感应',
+      5001: '天气采集瓶',
+      5002: '雷雨召唤瓶',
+      5003: '闪电变异瓶',
+      5004: '霹雳引雷瓶',
+      5005: '青蛙使坏瓶',
+      5006: '乌云使坏瓶',
+    }
+    const localItem = (id: string) => normalizeItem(
+      localInventory.find(item => text(item.id, item.itemId, item.item_id) === id)
+      || { id, name: itemNames[id] || `物品 ${id}`, count: '0' },
+    )
+    const badge = localItem('1027')
+    const collectionBottle = localItem('5001')
+    const rainBottle = localItem('5002')
+    const lightningSensePrimary = localItem('4002')
+    const lightningSenseSecondary = localItem('4003')
+    const lightningSenseCount = (Number(lightningSensePrimary.count) || 0) + (Number(lightningSenseSecondary.count) || 0)
+    const localShop = record(raw.shop)
+    const localCollector = record(raw.collector)
+    const localResearch = record(raw.research)
+    const localActions = record(raw.actions)
+    const researchAction = record(first(localActions.advanceResearch, localActions.advance_research))
+    const activityName = text(localActivity.name, '雨落成诗')
+    const activeWeather = bool(localOwnWeather.active)
+    const weatherKind = text(localOwnWeather.type)
+    const weatherStatus = text(localOwnWeather.status)
+    return {
+      groupId: text(raw.groupId, raw.group_id, localActivity.groupId, localActivity.group_id),
+      activityId: text(localActivity.id, localActivity.activityId, localActivity.activity_id, raw.groupId, raw.group_id),
+      catalogActivityId: text(localShop.activityId, localShop.activity_id, '2026070301'),
+      taskActivityId: text(localCollector.activityId, localCollector.activity_id, '2026070303'),
+      researchActivityId: text(localResearch.activityId, localResearch.activity_id, '2026070304'),
+      name: activityName,
+      title: activityName,
+      startTime: toMilliseconds(first(localActivity.startTime, localActivity.start_time)),
+      endTime: toMilliseconds(first(localActivity.endTime, localActivity.end_time)),
+      serverTime: toMilliseconds(first(raw.serverTime, raw.server_time)),
+      active: bool(raw.active),
+      rules: normalizeRules(raw.rules),
+      badge,
+      balances: {
+        badge: badge.count,
+        collectionBottle: collectionBottle.count,
+        rainBottle: rainBottle.count,
+        known: true,
+      },
+      inventory: {
+        known: true,
+        collectionBottle,
+        rainBottle,
+        lightningMutationBottle: localItem('5003'),
+        lightningAttractBottle: localItem('5004'),
+        frogBottle: localItem('5005'),
+        darkCloudBottle: localItem('5006'),
+        lightningSense: {
+          ...lightningSensePrimary,
+          name: lightningSensePrimary.name || lightningSenseSecondary.name || '闪电感应',
+          count: String(lightningSenseCount),
+          effectPerItemPercent: 2,
+          effectPercent: lightningSenseCount * 2,
+          passive: true,
+          active: lightningSenseCount > 0,
+        },
+      },
+      weather: Object.keys(localOwnWeather).length > 0
+        ? {
+            id: activeWeather ? weatherKind : '0',
+            type: weatherStatus,
+            typeName: weatherKind === '1' ? '雷雨' : (activeWeather ? `未知天气（ID ${weatherKind || '--'}）` : '无'),
+            statusName: weatherStatusName(weatherStatus, activeWeather),
+            beginTime: toMilliseconds(first(localOwnWeather.beginTime, localOwnWeather.begin_time)),
+            endTime: toMilliseconds(first(localOwnWeather.endTime, localOwnWeather.end_time)),
+            active: activeWeather,
+          }
+        : null,
+      friends: records(raw.friends).map(normalizeWeatherFriend),
+      catalog: Object.keys(localShop).length > 0
+        ? [{
+            id: text(localShop.goodsId, localShop.goods_id),
+            item: normalizeItem(localShop.item),
+            cost: normalizeItem(localShop.cost),
+            status: text(localShop.statusCode, localShop.status_code),
+            name: text(record(localShop.item).name, '天气瓶补给'),
+          }]
+        : [],
+      progress: {
+        taskId: '',
+        current: '0',
+        target: '0',
+        item: normalizeItem({}),
+        reward: normalizeItem({}),
+        rewardStatus: '',
+        status: '',
+        active: false,
+      },
+      tasks: records(raw.tasks).map(task => ({
+        id: text(task.id, task.taskId, task.task_id),
+        itemId: text(task.triggerItemId, task.trigger_item_id, task.itemId, task.item_id),
+        name: text(task.title, task.name),
+        target: text(task.dailyLimit, task.daily_limit, task.target),
+        reward: normalizeItem(task.reward),
+        current: text(task.current, '0'),
+        active: bool(task.active),
+      })),
+      research: records(localResearch.nodes).map(node => ({
+        id: text(node.id, node.nodeId, node.node_id),
+        prerequisites: Array.isArray(node.prerequisiteNodeIds)
+          ? node.prerequisiteNodeIds.map(String)
+          : (Array.isArray(node.prerequisite_node_ids) ? node.prerequisite_node_ids.map(String) : []),
+        status: text(node.statusCode, node.status_code, node.status),
+        opened: !bool(node.locked),
+        claimed: bool(node.completed, node.claimed),
+        claimable: bool(node.availableByStatus, node.available_by_status, node.claimable),
+        current: bool(node.availableByStatus, node.available_by_status, node.current),
+        featured: bool(node.featured),
+        extra: text(node.field9, node.field_9, node.extra),
+        cost: normalizeItem(node.cost),
+        reward: normalizeItem(node.reward),
+      })),
+      actions: {
+        research: {
+          enabled: bool(researchAction.enabled),
+          available: bool(researchAction.enabled),
+          availabilityKnown: true,
+          count: null,
+        },
+        scanFriendWeather: normalizeWeatherCommand(first(localActions.scanFriendWeather, localActions.scan_friend_weather)),
+      },
+    }
+  }
   const balances = record(raw.balances)
   const inventory = record(raw.inventory)
   const weather = record(raw.weather)
@@ -1005,6 +1391,8 @@ function normalizeWeather(value: unknown): WeatherActivityDto | null {
     title: text(raw.title, raw.name, '雨落成诗'),
     startTime: toMilliseconds(first(raw.startTime, raw.start_time)),
     endTime: toMilliseconds(first(raw.endTime, raw.end_time)),
+    serverTime: toMilliseconds(first(raw.serverTime, raw.server_time)),
+    active: bool(raw.active),
     rules: normalizeRules(raw.rules),
     badge: normalizeItem(raw.badge),
     balances: {
@@ -1034,17 +1422,24 @@ function normalizeWeather(value: unknown): WeatherActivityDto | null {
       },
     },
     weather: Object.keys(weather).length
-      ? {
-          id: text(weather.id, weather.weatherId, weather.weather_id),
-          type: text(weather.type, weather.weatherType, weather.weather_type),
-          typeName: weather.typeName == null
-            ? (weather.type_name == null ? null : text(weather.type_name))
-            : text(weather.typeName),
-          beginTime: toMilliseconds(first(weather.beginTime, weather.begin_time)),
-          endTime: toMilliseconds(first(weather.endTime, weather.end_time)),
-          active: !['', '0'].includes(text(weather.id, weather.weatherId, weather.weather_id)),
-        }
+      ? (() => {
+          const weatherType = text(weather.id, weather.weatherId, weather.weather_id)
+          const status = text(weather.type, weather.status, weather.weatherStatus, weather.weather_status)
+          const active = bool(weather.active) || !['', '0'].includes(weatherType)
+          return {
+            id: weatherType,
+            type: status,
+            typeName: weather.typeName == null
+              ? (weather.type_name == null ? null : text(weather.type_name))
+              : text(weather.typeName),
+            statusName: text(weather.statusName, weather.status_name) || weatherStatusName(status, active),
+            beginTime: toMilliseconds(first(weather.beginTime, weather.begin_time)),
+            endTime: toMilliseconds(first(weather.endTime, weather.end_time)),
+            active,
+          }
+        })()
       : null,
+    friends: records(raw.friends).map(normalizeWeatherFriend),
     catalog: records(raw.catalog).map(entry => ({
       id: text(entry.id),
       item: normalizeItem(entry.item),
@@ -1084,7 +1479,10 @@ function normalizeWeather(value: unknown): WeatherActivityDto | null {
       cost: normalizeItem(node.cost),
       reward: normalizeItem(node.reward),
     })),
-    actions: { research: normalizeAction(actions, {}, ['research']) },
+    actions: {
+      research: normalizeAction(actions, {}, ['research']),
+      scanFriendWeather: normalizeWeatherCommand(first(actions.scanFriendWeather, actions.scan_friend_weather)),
+    },
   }
 }
 
@@ -1145,6 +1543,7 @@ export function normalizeActivitySnapshot(value: unknown): ActivityCenterSnapsho
     constellation: normalizeConstellation(first(root.constellation, root.constellationActivity, seasonRecord.constellation, seasonRecord.constellationActivity, seasonRecord.starContract, seasonRecord.contract)),
     qixi: normalizeQixi(first(root.qixi, root.qiXi, root.qi_xi)),
     qingMei: normalizeQingMei(first(root.qingMei, root.qingmei, root.qing_mei)),
+    charity: normalizeCharityRedFlower(first(root.charity, root.charityRedFlower, root.charity_red_flower)),
     weather: normalizeWeather(first(root.weather, root.weatherActivity, root.weather_activity)),
     actions: {
       claimPass: normalizeAction(actionsRaw, capabilitiesRaw, ['claimPass', 'passClaim', 'pass_claim']),
@@ -1154,6 +1553,9 @@ export function normalizeActivitySnapshot(value: unknown): ActivityCenterSnapsho
       qixiBridge: normalizeAction(actionsRaw, capabilitiesRaw, ['qixiBridge', 'qixi_bridge']),
       qixiGift: normalizeAction(actionsRaw, capabilitiesRaw, ['qixiGift', 'qixi_gift']),
       qixiDew: normalizeAction(actionsRaw, capabilitiesRaw, ['qixiDew', 'qixi_dew']),
+      charityClaimSeeds: normalizeAction(actionsRaw, capabilitiesRaw, ['charityClaimSeeds', 'charity_claim_seeds']),
+      charityDonateLove: normalizeAction(actionsRaw, capabilitiesRaw, ['charityDonateLove', 'charity_donate_love']),
+      charityClaimDailyGift: normalizeAction(actionsRaw, capabilitiesRaw, ['charityClaimDailyGift', 'charity_claim_daily_gift']),
     },
   }
 }
@@ -1183,6 +1585,19 @@ const activityErrorMessages: Record<string, string> = {
   INSUFFICIENT_QIXI_SACHET: '鹊羽香囊数量不足',
   QIXI_RESPONSE_INVALID: '鹊桥活动数据已经变化，请刷新页面后重试',
   QIXI_GIFT_FAILED: '鹊羽香囊赠送失败，请刷新后重试',
+  1034091: '当前爱心不足，无法捐赠',
+  1034087: '该公益进度奖励档位已经领取',
+  1034088: '今天还没有收获小红花，暂时无法领取公益礼包',
+  1034092: '今天还没有收获小红花，暂时无法领取公益礼包',
+  CHARITY_RED_FLOWER_UNAVAILABLE: '公益小红花活动暂未开放或已经结束',
+  CHARITY_RED_FLOWER_RESPONSE_INVALID: '公益小红花活动数据已经变化，请刷新页面后重试',
+  CHARITY_SEEDS_UNAVAILABLE: '当前没有可领取的小红花种子',
+  INSUFFICIENT_CHARITY_LOVE: '当前没有可捐赠的爱心',
+  CHARITY_PROGRESS_REWARD_UNAVAILABLE: '当前没有可领取的公益进度奖励',
+  CHARITY_PROGRESS_REWARD_ALREADY_CLAIMED: '该公益进度奖励档位已经领取',
+  CHARITY_DAILY_GIFT_UNAVAILABLE: '今日公益礼包已经领取或暂不可领取',
+  CHARITY_DAILY_GIFT_NOT_HARVESTED: '今天还没有收获小红花，暂时无法领取公益礼包',
+  CHARITY_AGREEMENT_REQUIRED: '请先同意公益活动规则',
   INVALID_WEATHER_BOTTLE_COUNT: '天气瓶购买数量必须是正整数',
   INVALID_WEATHER_NODE: '研究节点信息无效，请刷新活动后重试',
   INVALID_WEATHER_TARGET_GID: '好友信息无效，请重新选择',
@@ -1196,7 +1611,22 @@ const activityErrorMessages: Record<string, string> = {
   1033014: '当前已有特殊天气，暂时无法召唤降雨',
   1000019: '雷电徽章不足，无法推进研究',
   1034018: '天气采集瓶不足，无法采集',
-  1034040: '该好友已经采过雨了，去其他好友家看看吧',
+  1034040: '当前这轮雷雨已经采过，下轮雷雨可再次采集',
+  WEATHER_ACTIVITY_UNAVAILABLE: '雨落成诗活动尚未开放或已经结束',
+  WEATHER_SHOP_UNAVAILABLE: '天气采集瓶商店当前不可用',
+  WEATHER_SHOP_ALREADY_EXCHANGED: '今日已经兑换过天气采集瓶',
+  INVALID_WEATHER_FRIEND_GID: '好友信息无效，请刷新活动后重新选择',
+  WEATHER_SCAN_BATCH_TOO_LARGE: '单批检查的好友数量超出上限，请刷新页面后重试',
+  WEATHER_COLLECTOR_UNAVAILABLE: '背包中没有可用的天气采集瓶',
+  WEATHER_FRIEND_NOT_THUNDERSTORM: '该好友农场当前不是雷雨天气',
+  WEATHER_ALREADY_COLLECTED: '当前这轮雷雨已经采过，下轮雷雨可再次采集',
+  WEATHER_SUMMON_UNAVAILABLE: '背包中没有可用的雷雨召唤瓶',
+  WEATHER_ALREADY_ACTIVE: '自己的农场当前已有特殊天气',
+  INVALID_WEATHER_RESEARCH_NODE: '气象研究节点信息无效，请刷新后重试',
+  WEATHER_RESEARCH_UNAVAILABLE: '气象研究数据暂不可用，请刷新后重试',
+  WEATHER_RESEARCH_ALREADY_COMPLETED: '该气象研究节点已经完成',
+  WEATHER_RESEARCH_LOCKED: '请先完成前置气象研究节点',
+  INSUFFICIENT_LIGHTNING_BADGES: '雷电徽章不足',
   QIXI_DEW_ACCOUNT_UNAVAILABLE: '当前账号尚未就绪，请稍后重试',
   INVALID_QIXI_DEW_HOST_GID: '农场主人信息无效，请重新选择',
   INVALID_QIXI_DEW_LAND_ID: '地块信息无效，请刷新后重选',
@@ -1265,11 +1695,20 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     startQingMeiBrew: false,
     continueQingMeiBrew: false,
     settleQingMeiBrew: false,
+    claimCharitySeeds: false,
+    donateCharityLove: false,
+    claimCharityDailyGift: false,
+    claimCharityProgress: false,
     lightWeatherResearch: false,
     buyWeatherBottle: false,
+    scanWeatherFriends: false,
     collectWeatherBottle: false,
     summonWeatherRain: false,
   })
+
+  const weatherFriends = ref<WeatherFriendDto[]>([])
+  const weatherFriendsLoading = ref(false)
+  const weatherFriendInspectingGid = ref('')
 
   const season = computed(() => snapshot.value.season)
   const activities = computed(() => snapshot.value.activities)
@@ -1279,6 +1718,11 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
   const constellation = computed(() => snapshot.value.constellation)
   const qixi = computed(() => snapshot.value.qixi)
   const qingMei = computed(() => snapshot.value.qingMei)
+  const charity = computed(() => snapshot.value.charity)
+  const weather = computed<WeatherActivityDto | null>(() => {
+    const value = snapshot.value.weather
+    return value ? { ...value, friends: weatherFriends.value } : null
+  })
   const actions = computed(() => snapshot.value.actions)
   const serverNow = computed(() => Date.now() + serverClockOffset.value)
   const tabBadges = computed<Partial<Record<ActivityTabKey, boolean>>>(() => ({
@@ -1287,6 +1731,12 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     solar: actions.value.claimSolar.available,
     weather: !!snapshot.value.weather?.actions.research.available,
   }))
+
+  function clearWeatherFriends() {
+    weatherFriends.value = []
+    weatherFriendsLoading.value = false
+    weatherFriendInspectingGid.value = ''
+  }
 
   function reset() {
     requestVersion.value += 1
@@ -1297,7 +1747,8 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     notice.value = ''
     loadedAccountId.value = ''
     serverClockOffset.value = 0
-    pendingActions.value = { claimPass: false, lightConstellation: false, claimSolar: false, exchange: false, claimQixiBridge: false, giftQixiSachet: false, claimQingMeiSeed: false, startQingMeiBrew: false, continueQingMeiBrew: false, settleQingMeiBrew: false, lightWeatherResearch: false, buyWeatherBottle: false, collectWeatherBottle: false, summonWeatherRain: false }
+    clearWeatherFriends()
+    pendingActions.value = { claimPass: false, lightConstellation: false, claimSolar: false, exchange: false, claimQixiBridge: false, giftQixiSachet: false, claimQingMeiSeed: false, startQingMeiBrew: false, continueQingMeiBrew: false, settleQingMeiBrew: false, claimCharitySeeds: false, donateCharityLove: false, claimCharityDailyGift: false, claimCharityProgress: false, lightWeatherResearch: false, buyWeatherBottle: false, scanWeatherFriends: false, collectWeatherBottle: false, summonWeatherRain: false }
   }
 
   function clearActionMessages() {
@@ -1313,7 +1764,7 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
   function applySnapshot(value: unknown, clientStartedAt = Date.now()) {
     const normalized = normalizeActivitySnapshot(value)
     snapshot.value = normalized
-    const serverTime = [normalized.serverTime, normalized.season?.serverTime, normalized.shop?.serverTime, normalized.solarTerms?.serverTime, normalized.constellation?.serverTime, normalized.qixi?.serverTime]
+    const serverTime = [normalized.serverTime, normalized.season?.serverTime, normalized.shop?.serverTime, normalized.solarTerms?.serverTime, normalized.constellation?.serverTime, normalized.qixi?.serverTime, normalized.charity?.serverTime, normalized.weather?.serverTime]
       .find(value => value !== null && value !== undefined)
     if (serverTime !== undefined && serverTime !== null)
       serverClockOffset.value = serverTime - Math.round((clientStartedAt + Date.now()) / 2)
@@ -1337,7 +1788,7 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     error.value = ''
     try {
       let detail: unknown
-      let detailKey: 'season' | 'qixi' | 'qingMei' | 'weather' | null = null
+      let detailKey: 'season' | 'qixi' | 'qingMei' | 'charity' | 'weather' | null = null
       if (gameplayKey === 'qixi') {
         const response = await api.get('/api/activity-center/qixi', { headers: { 'x-account-id': requestedAccountId }, skipErrorToast: true } as any)
         detail = responsePayload(response.data)
@@ -1347,6 +1798,11 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
         const response = await api.get('/api/activity-center/qingmei', { headers: { 'x-account-id': requestedAccountId }, skipErrorToast: true } as any)
         detail = responsePayload(response.data)
         detailKey = 'qingMei'
+      }
+      else if (gameplayKey === 'charity') {
+        const response = await api.get('/api/activity-center/charity-red-flower', { headers: { 'x-account-id': requestedAccountId }, skipErrorToast: true } as any)
+        detail = responsePayload(response.data)
+        detailKey = 'charity'
       }
       else if (gameplayKey === 'weather') {
         const response = await api.get('/api/activity-center/weather', { headers: { 'x-account-id': requestedAccountId }, skipErrorToast: true } as any)
@@ -1394,6 +1850,7 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
       snapshot.value = normalizeActivitySnapshot({})
       loadedAccountId.value = ''
       serverClockOffset.value = 0
+      clearWeatherFriends()
     }
 
     try {
@@ -1437,7 +1894,7 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     return request
   }
 
-  async function mutate(key: ActivityMutationKey, path: string, accountId: string, payload: ActivityRecord = {}) {
+  async function mutate(key: ActivityMutationKey, path: string, accountId: string, payload: ActivityRecord = {}, options: { silentSuccess?: boolean, timeoutMs?: number } = {}) {
     const requestedAccountId = String(accountId || '').trim()
     if (!requestedAccountId || pendingActions.value[key])
       return false
@@ -1449,19 +1906,67 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
       const response = await api.post(`/api/activity-center${path}`, payload, {
         headers: { 'x-account-id': requestedAccountId },
         skipErrorToast: true,
+        ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
       } as any)
       const result = responsePayload(response.data)
       if (!isCurrent(version, requestedAccountId))
         return false
       const resultRecord = record(result)
+      if (path.startsWith('/weather/')) {
+        const mutationFriend = record(resultRecord.friend)
+        if (Object.keys(mutationFriend).length > 0)
+          mergeWeatherFriends([normalizeWeatherFriend(mutationFriend)])
+        const mutationFriends = records(resultRecord.friends)
+        if (mutationFriends.length > 0)
+          mergeWeatherFriends(mutationFriends.map(normalizeWeatherFriend))
+      }
       const mutationSnapshot = first(resultRecord.snapshot, resultRecord.activityCenter, resultRecord.activity_center)
-      if (mutationSnapshot)
-        applySnapshot(mutationSnapshot)
-      else
+      if (mutationSnapshot) {
+        const mutationRecord = record(mutationSnapshot)
+        if (path.startsWith('/weather/') && !Object.prototype.hasOwnProperty.call(mutationRecord, 'weather')) {
+          const current = record(snapshot.value)
+          applySnapshot({ ...current, weather: mutationSnapshot })
+        }
+        else if (path.startsWith('/charity-red-flower/') && !Object.prototype.hasOwnProperty.call(mutationRecord, 'charity')) {
+          const current = record(snapshot.value)
+          const charityActions = record(mutationRecord.actions)
+          applySnapshot({
+            ...current,
+            charity: mutationSnapshot,
+            actions: {
+              ...record(current.actions),
+              charityClaimSeeds: charityActions.claimSeeds,
+              charityDonateLove: charityActions.donateLove,
+              charityClaimDailyGift: charityActions.claimDailyGift,
+            },
+          })
+        }
+        else {
+          applySnapshot(mutationSnapshot)
+        }
+      }
+      else {
         await load(requestedAccountId, true)
+      }
+      if (key === 'claimCharityProgress') {
+        const claimedTarget = text(resultRecord.target)
+        const currentCharity = snapshot.value.charity
+        if (claimedTarget && currentCharity) {
+          snapshot.value = {
+            ...snapshot.value,
+            charity: {
+              ...currentCharity,
+              progressRewards: currentCharity.progressRewards.map(reward => reward.target === claimedTarget
+                ? { ...reward, claimed: true, claimable: false }
+                : reward),
+            },
+          }
+        }
+      }
       const rewards = records(resultRecord.rewards).map(normalizeItem).filter(item => item.id || item.name)
       const rewardSummary = rewards.map(item => `${item.name || item.id}${item.count ? ` ×${item.count}` : ''}`).join('、')
-      notice.value = text(resultRecord.message, record(response.data).message, rewardSummary ? `获得 ${rewardSummary}` : '操作成功')
+      if (!options.silentSuccess)
+        notice.value = text(resultRecord.message, record(response.data).message, rewardSummary ? `获得 ${rewardSummary}` : '操作成功')
       return resultRecord
     }
     catch (mutationError) {
@@ -1514,12 +2019,114 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     return mutate('settleQingMeiBrew', '/qingmei/brew/settle', accountId)
   }
 
+  function claimCharityRedFlowerSeeds(accountId: string) {
+    return mutate('claimCharitySeeds', '/charity-red-flower/seeds/claim', accountId)
+  }
+
+  function donateCharityRedFlowerLove(accountId: string) {
+    return mutate('donateCharityLove', '/charity-red-flower/love/donate', accountId)
+  }
+
+  function claimCharityRedFlowerDailyGift(accountId: string) {
+    return mutate('claimCharityDailyGift', '/charity-red-flower/daily-gift/claim', accountId)
+  }
+
+  function claimCharityRedFlowerProgressReward(accountId: string, target: string) {
+    return mutate('claimCharityProgress', '/charity-red-flower/progress/claim', accountId, { target })
+  }
+
   function lightWeatherResearch(accountId: string, nodeId: string) {
     return mutate('lightWeatherResearch', '/weather/research/light', accountId, { nodeId })
   }
 
   function buyWeatherBottle(accountId: string, count = 1) {
     return mutate('buyWeatherBottle', '/weather/bottle/buy', accountId, { count })
+  }
+
+  async function loadWeatherFriends(accountId: string) {
+    const requestedAccountId = String(accountId || '').trim()
+    if (!requestedAccountId)
+      return false
+    const version = requestVersion.value
+    weatherFriendsLoading.value = true
+    try {
+      const response = await api.get('/api/activity-center/weather/friends', {
+        headers: { 'x-account-id': requestedAccountId },
+        skipErrorToast: true,
+      } as any)
+      const payload = responsePayload(response.data)
+      if (!isCurrent(version, requestedAccountId))
+        return false
+      weatherFriends.value = records(Array.isArray(payload) ? payload : record(payload).friends).map(normalizeWeatherFriend)
+      return true
+    }
+    catch (loadError) {
+      if (isCurrent(version, requestedAccountId))
+        actionError.value = errorMessage(loadError, '好友天气列表加载失败')
+      return false
+    }
+    finally {
+      weatherFriendsLoading.value = false
+    }
+  }
+
+  function mergeWeatherFriends(updates: WeatherFriendDto[]) {
+    if (updates.length === 0)
+      return
+    const updateMap = new Map(updates.map(friend => [friend.gid, friend]))
+    const current = weatherFriends.value
+    for (let index = 0; index < current.length; index += 1) {
+      const update = updateMap.get(current[index]!.gid)
+      if (!update)
+        continue
+      current[index] = update
+      updateMap.delete(update.gid)
+    }
+  }
+
+  /**
+   * 点击好友时读取这位好友的现场天气：只发一次单人扫描请求，后端命中 10 分钟缓存时不会进农场。
+   * 后端给好友任务让路时回包里没有这位好友，此时保持原状态并提示稍后再点。
+   */
+  async function inspectWeatherFriend(accountId: string, friendGid: string) {
+    const requestedAccountId = String(accountId || '').trim()
+    const gid = String(friendGid || '').trim()
+    if (!requestedAccountId || !gid || Number(gid) <= 0)
+      return false
+    if (pendingActions.value.scanWeatherFriends)
+      return false
+    const version = requestVersion.value
+    pendingActions.value.scanWeatherFriends = true
+    weatherFriendInspectingGid.value = gid
+    actionError.value = ''
+    notice.value = ''
+    try {
+      const response = await api.post('/api/activity-center/weather/friends/scan', { friendGids: [gid] }, {
+        headers: { 'x-account-id': requestedAccountId },
+        skipErrorToast: true,
+        timeout: 60000,
+      } as any)
+      const result = record(responsePayload(response.data))
+      if (!isCurrent(version, requestedAccountId))
+        return false
+      const updates = records(result.friends).map(normalizeWeatherFriend)
+      mergeWeatherFriends(updates)
+      if (updates.length === 0) {
+        notice.value = '好友任务正在执行，请稍后再点这位好友'
+        return false
+      }
+      return true
+    }
+    catch (inspectError) {
+      if (isCurrent(version, requestedAccountId))
+        actionError.value = errorMessage(inspectError, '好友现场天气读取失败')
+      return false
+    }
+    finally {
+      if (weatherFriendInspectingGid.value === gid)
+        weatherFriendInspectingGid.value = ''
+      pendingActions.value.scanWeatherFriends = false
+    }
   }
 
   function collectWeatherBottle(accountId: string, targetGid: string) {
@@ -1548,7 +2155,11 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     constellation,
     qixi,
     qingMei,
-    weather: computed(() => snapshot.value.weather),
+    charity,
+    weather,
+    weatherFriends,
+    weatherFriendsLoading,
+    weatherFriendInspectingGid,
     actions,
     tabBadges,
     loading,
@@ -1562,6 +2173,7 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     lazyLoad,
     refresh,
     loadDetails,
+    loadWeatherFriends,
     claimPass,
     lightConstellation,
     claimSolarTerm,
@@ -1572,8 +2184,13 @@ export const useActivityCenterStore = defineStore('activity-center', () => {
     startQingMeiBrew,
     continueQingMeiBrew,
     settleQingMeiBrew,
+    claimCharityRedFlowerSeeds,
+    donateCharityRedFlowerLove,
+    claimCharityRedFlowerDailyGift,
+    claimCharityRedFlowerProgressReward,
     lightWeatherResearch,
     buyWeatherBottle,
+    inspectWeatherFriend,
     collectWeatherBottle,
     summonWeatherRain,
     clearActionMessages,

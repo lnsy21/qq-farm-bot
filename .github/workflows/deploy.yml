@@ -1,0 +1,46 @@
+name: Build & Deploy Docker
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH Deploy to Server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            DIR="/home/${{ secrets.SSH_USER }}/qq-farm-bot"
+            # 使用git协议，不需要用户名密码
+            GIT_REPO="git://gitee.com/sheson/qq-farm-bot.git"
+
+            # 删除全局git配置，清除ghproxy劫持
+            rm -f ~/.gitconfig
+
+            if [ -d "$DIR" ]; then
+              cd $DIR
+              REMOTE_URL=$(git remote get-url origin | xargs)
+              echo "当前 origin = $REMOTE_URL"
+              if [ "$REMOTE_URL" != "$GIT_REPO" ]; then
+                echo "地址不对，删除旧目录，重新克隆"
+                cd ~
+                rm -rf $DIR
+              fi
+            fi
+
+            if [ ! -d "$DIR" ]; then
+              echo "从Gitee git协议克隆"
+              git clone --depth 1 $GIT_REPO $DIR
+            fi
+
+            cd $DIR
+            git pull origin master
+
+            docker compose up -d --build
+            docker image prune -f
+            echo "✅ 部署完成"

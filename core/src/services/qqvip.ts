@@ -9,6 +9,8 @@ const { log, toNum, getSystemDateKey } = require('../utils/utils');
 
 const DAILY_KEY: string = 'vip_daily_gift';
 const CHECK_COOLDOWN_MS: number = 10 * 60 * 1000;
+const NOT_QQ_VIP_ERROR_CODE: number = 1021001;
+const ALREADY_CLAIMED_ERROR_CODE: number = 1021002;
 
 let doneDateKey: string = '';
 let lastCheckAt: number = 0;
@@ -40,9 +42,18 @@ function getRewardSummary(items: any[]): string {
     return summary.join('/');
 }
 
+function hasErrorCode(err: any, code: number): boolean {
+    if (Number(err && err.code) === code) return true;
+    return new RegExp(`\\bcode=${code}\\b`).test(String((err && err.message) || err || ''));
+}
+
+function isNotQQVipError(err: any): boolean {
+    return hasErrorCode(err, NOT_QQ_VIP_ERROR_CODE);
+}
+
 function isAlreadyClaimedError(err: any): boolean {
     const msg: string = String((err && err.message) || '');
-    return msg.includes('code=1021002') || msg.includes('今日已领取') || msg.includes('已领取');
+    return hasErrorCode(err, ALREADY_CLAIMED_ERROR_CODE) || msg.includes('今日已领取') || msg.includes('已领取');
 }
 
 async function getQQVipRewardsStatus(): Promise<any> {
@@ -61,7 +72,12 @@ async function claimQQVipRewards(rewardTypes: number[]): Promise<any> {
     const body: Uint8Array = types.ClaimQQVipRewardsRequest.encode(types.ClaimQQVipRewardsRequest.create({
         reward_types: rewardTypes,
     })).finish();
-    const { body: replyBody } = await sendMsgAsync('gamepb.qqvippb.QQVipService', 'ClaimQQVipRewards', body);
+    const { body: replyBody } = await sendMsgAsync(
+        'gamepb.qqvippb.QQVipService',
+        'ClaimQQVipRewards',
+        body,
+        { expectedErrorCodes: [NOT_QQ_VIP_ERROR_CODE, ALREADY_CLAIMED_ERROR_CODE] },
+    );
     return types.ClaimQQVipRewardsReply.decode(replyBody);
 }
 
@@ -78,20 +94,23 @@ async function performDailyVipGift(force: boolean = false): Promise<boolean> {
             ? status.reward_statuses
             : [];
         const rewardTypes: number[] = rewardStatuses
-            .filter((item: any) => item && item.enabled === true && item.can_claim === true)
+            .filter((item: any) => item?.is_enable === true && status.is_qq_vip === true
+                && (toNum(item.type) === 1 ? status.can_claim === true : status.rewards_can_claim === true))
             .map((item: any) => toNum(item.reward_type))
             .filter((rewardType: number) => rewardType > 0);
-        lastHasGift = rewardStatuses.some((item: any) => item && item.enabled === true);
+        lastHasGift = rewardStatuses.some((item: any) => item?.is_enable === true && status.is_qq_vip === true);
         lastCanClaim = rewardTypes.length > 0;
+        const mallClaimed = await claimSvipMallFreeGift(status);
+        if (mallClaimed) lastClaimAt = Date.now();
         if (rewardTypes.length === 0) {
             markDoneToday();
-            lastResult = 'none';
-            log('会员', '今日暂无可领取会员礼包', {
+            lastResult = mallClaimed ? 'ok' : 'none';
+            log('会员', mallClaimed ? 'SVIP 商城免费礼包领取成功' : '今日暂无可领取会员礼包', {
                 module: 'task',
                 event: DAILY_KEY,
-                result: 'none',
+                result: mallClaimed ? 'ok' : 'none',
             });
-            return false;
+            return mallClaimed;
         }
         const rep: any = await claimQQVipRewards(rewardTypes);
         const items: any[] = Array.isArray(rep && rep.items) ? rep.items : [];
@@ -108,6 +127,19 @@ async function performDailyVipGift(force: boolean = false): Promise<boolean> {
         lastResult = 'ok';
         return true;
     } catch (e: any) {
+        if (isNotQQVipError(e)) {
+            markDoneToday();
+            lastResult = 'none';
+            lastHasGift = false;
+            lastCanClaim = false;
+            log('会员', '非QQ会员，跳过会员礼包', {
+                module: 'task',
+                event: DAILY_KEY,
+                result: 'none',
+                reason: 'not_qq_vip',
+            });
+            return false;
+        }
         if (isAlreadyClaimedError(e)) {
             markDoneToday();
             lastClaimAt = Date.now();
@@ -129,7 +161,21 @@ async function performDailyVipGift(force: boolean = false): Promise<boolean> {
     }
 }
 
+async function claimSvipMallFreeGift(status: any): Promise<boolean> {
+    if (status.is_qq_vip !== true || status.mall_free_can_claim !== true) return false;
+    const mall = require('./mall');
+    const reply = await mall.getMallListBySlotType(4);
+    const goods = (reply.goods_list || []).filter((v: any) => v.is_free === true && v.is_available === true
+        && toNum(v.price?.count) === 0 && !v.ad_only && !v.share?.share_only
+        && !v.is_owned && (!v.purchase_limit || toNum(v.purchase_limit.limit_count) <= 0 || toNum(v.purchase_limit.bought_count) < toNum(v.purchase_limit.limit_count)));
+    for (const product of goods) await mall.purchaseMallGoods(toNum(product.goods_id), 1);
+    return goods.length > 0;
+}
+
 module.exports = {
+    getQQVipRewardsStatus,
+    refreshVipInfo,
+    claimSvipMallFreeGift,
     performDailyVipGift,
     getVipDailyState: () => ({
         key: DAILY_KEY,
